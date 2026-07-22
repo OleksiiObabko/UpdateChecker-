@@ -92,20 +92,19 @@ slackApp.message(async ({ message, client }) => {
 		if (!parentMessage || !parentMessage.text) return;
 
 		const match = parentMessage.text.match(/\b(\d+)\b/);
+		if (!match) return;
 
-		if (match) {
-			const transactionId = match[1];
-			const matchedTx = activeTransactions.find(tx => tx.transactionId === transactionId);
+		const transactionId = match[1];
+		const matchedTx = activeTransactions.find(tx => tx.transactionId === transactionId);
 
-			if (matchedTx) {
-				console.log(`Апдейт Slack: ID ${transactionId}, ПС ${matchedTx.psName}, Зона ${matchedTx.sheetName}`);
-				const doc = await initGoogleSheets();
-				await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, 'update');
-				matchedTx.status = 'update';
-			}
+		if (matchedTx) {
+			console.log(`Slack-апдейт: ID ${transactionId}, ПС ${matchedTx.psName}, Зона ${matchedTx.sheetName}`);
+			const doc = await initGoogleSheets();
+			await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, 'update');
+			matchedTx.status = 'update';
 		}
 	} catch (error) {
-		console.error(error);
+		console.error('Помилка обробки Slack-повідомлення:', error);
 	}
 });
 
@@ -118,7 +117,7 @@ async function main() {
 	try {
 		await initTelegramClients();
 	} catch (error) {
-		console.error(error);
+		console.error('Помилка ініціалізації Telegram:', error);
 	}
 
 	await updateCacheShared(mainDoc, targetSheets);
@@ -147,14 +146,13 @@ async function main() {
 				try {
 					await checkExternalPsUpdates(mainDoc, externalDoc, activeTransactions);
 				} catch (error) {
-					console.error(error);
+					console.error('Помилка перевірки ПС:', error);
 				}
 			}
 		}
 
 		const cM = Math.floor(cacheCountdown / 60).toString().padStart(2, '0');
 		const cS = (cacheCountdown % 60).toString().padStart(2, '0');
-
 		const pM = Math.floor(psCountdown / 60).toString().padStart(2, '0');
 		const pS = (psCountdown % 60).toString().padStart(2, '0');
 

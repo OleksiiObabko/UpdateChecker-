@@ -4,8 +4,6 @@ const credentials = require('../credentials.json');
 
 const SHEET_ID = process.env.SHEET_ID;
 
-// Валюта → список аркушів зовнішньої книги, де може лежати транзакція.
-// Для INR є кілька кандидатів — перевіряються по черзі, поки не знайдеться збіг.
 const CURRENCY_SHEET_MAP = {
 	'INR': ['all INR', 'ASAP INR', 'Bulk INR', 'INR induvidual'],
 	'NPR': ['NPR'],
@@ -13,6 +11,8 @@ const CURRENCY_SHEET_MAP = {
 	'LKR': ['LKR'],
 	'PKR': ['PKR']
 };
+
+const NON_FINAL_STATUSES = ['', 'в работе'];
 
 function createServiceAccountAuth() {
 	return new JWT({
@@ -49,7 +49,6 @@ async function fetchActiveTransactions(doc, targetSheets) {
 			const bankTransactionIdRaw = row.get('status.bankTransactionId');
 			const psNameRaw = row.get('ПС');
 			const ourIdRaw = row.get(sheet.headerValues[3]);
-			// Колонка C — Валюта. Якщо назва заголовка інша, підстрахуємось позицією.
 			const currencyRaw = row.get('Валюта') || row.get(sheet.headerValues[2]);
 
 			const expectFrom = expectFromRaw ? expectFromRaw.toString().trim().toLowerCase() : '';
@@ -106,19 +105,15 @@ async function updateTransactionStatus(doc, sheetName, transactionId, newStatus)
 		return false;
 	}
 
-	// Звір з реальною назвою колонки статусу в таблиці — тут очікується 'Статус'
 	row.set('Статус', newStatus);
 	await row.save();
+	console.log(`Транзакція ${transactionId} (${sheetName}): статус змінено на "${newStatus}"`);
 	return true;
 }
 
 async function findTransactionInExternalSheets(externalDoc, tx, sheetCache) {
 	const candidates = CURRENCY_SHEET_MAP[tx.currency] || [];
-
-	if (candidates.length === 0) {
-		console.log(`[ДЕБАГ] Невідома/відсутня валюта для ${tx.transactionId}: "${tx.currency}"`);
-		return null;
-	}
+	if (candidates.length === 0) return null;
 
 	for (const sheetName of candidates) {
 		const sheet = externalDoc.sheetsByTitle[sheetName];
@@ -129,7 +124,6 @@ async function findTransactionInExternalSheets(externalDoc, tx, sheetCache) {
 		}
 		const rows = sheetCache.get(sheetName);
 
-		// Збираємо ВСІ збіги (транзакція могла подаватись кілька разів)
 		const matches = rows.filter(r => {
 			const ufId = r.get('UF ID');
 			const orderId = r.get('Order ID');
@@ -138,10 +132,6 @@ async function findTransactionInExternalSheets(externalDoc, tx, sheetCache) {
 		});
 
 		if (matches.length === 0) continue;
-
-		if (matches.length > 1) {
-			console.log(`[ДЕБАГ] ${tx.transactionId} подавалась ${matches.length} раз(и) в "${sheetName}", беремо останнє звернення (рядок ${matches[matches.length - 1].rowNumber})`);
-		}
 
 		// Останній рядок у таблиці = останнє (найновіше) звернення
 		const row = matches[matches.length - 1];
@@ -160,27 +150,54 @@ async function checkExternalPsUpdates(doc, externalDoc, transactions) {
 			externalPsNames.includes(tx.psName.toLowerCase()) && tx.status.toLowerCase() === 'in progress'
 		);
 
-		console.log(`[ДЕБАГ] Активних транзакцій загалом: ${transactions.length}. З них підходять під EXTERNAL_PS_NAMES та 'in progress': ${activeTransactions.length}`);
+		if (activeTransactions.length === 0) return;
 
 		const sheetCache = new Map();
+		const mainSheetRowsCache = new Map();
+		let updatedCount = 0;
 
 		for (const tx of activeTransactions) {
 			const found = await findTransactionInExternalSheets(externalDoc, tx, sheetCache);
 			if (!found) continue;
 
 			const rowStatus = found.row.get('Status') ? found.row.get('Status').toString().trim().toLowerCase() : '';
-			console.log(`[ДЕБАГ] ${tx.transactionId} (${tx.currency}) знайдено в "${found.sheetName}", статус: "${rowStatus}"`);
+			if (NON_FINAL_STATUSES.includes(rowStatus)) continue;
 
-			const NON_FINAL_STATUSES = ['', 'в работе'];
-
-			if (!NON_FINAL_STATUSES.includes(rowStatus)) {
-				await updateTransactionStatus(doc, tx.sheetName, tx.transactionId, 'update');
-				tx.status = 'update';
-				console.log(`Статус транзакції ${tx.transactionId} змінено на update`);
+			const mainSheet = doc.sheetsByTitle[tx.sheetName];
+			if (!mainSheet) {
+				console.error(`Аркуш "${tx.sheetName}" не знайдено в основній таблиці`);
+				continue;
 			}
+
+			if (!mainSheetRowsCache.has(tx.sheetName)) {
+				mainSheetRowsCache.set(tx.sheetName, await mainSheet.getRows());
+			}
+			const mainRows = mainSheetRowsCache.get(tx.sheetName);
+
+			const row = mainRows.find(r => {
+				const bankId = r.get('status.bankTransactionId');
+				const ourId = r.get(mainSheet.headerValues[3]);
+				return (bankId && bankId.toString().trim() === tx.transactionId.toString().trim()) ||
+					(ourId && ourId.toString().trim() === tx.transactionId.toString().trim());
+			});
+
+			if (!row) {
+				console.error(`Рядок для ID ${tx.transactionId} не знайдено в "${tx.sheetName}" (видалений/змінений?)`);
+				continue;
+			}
+
+			row.set('Статус', 'update');
+			await row.save();
+			tx.status = 'update';
+			updatedCount++;
+			console.log(`Транзакція ${tx.transactionId} (${tx.sheetName}, ${tx.currency}) → update. Статус ПС: "${rowStatus}"`);
+		}
+
+		if (updatedCount > 0) {
+			console.log(`Перевірка ПС: оновлено статусів — ${updatedCount} з ${activeTransactions.length}`);
 		}
 	} catch (error) {
-		console.error(error.message);
+		console.error('Помилка перевірки ПС:', error.message);
 	}
 }
 

@@ -1,13 +1,23 @@
 require('dotenv').config();
 const { initGoogleSheets, fetchActiveTransactions, updateTransactionStatus } = require('./services/googleSheets');
-const { initTelegram } = require('./services/telegram');
-const psChatMap = require('./chatMap.json');
+const { initTelegramClients } = require('./services/telegram');
 const { NewMessage } = require('telegram/events');
 
 let activeTransactions = [];
 let globalMessageCache = new Map();
-const targetSheets = ['Дракони', 'Лелеки', 'Корови', 'Вулик', 'Джира', 'Кити', 'Нексус'];
+const targetSheets = ['Вулик'];
 let fetchPromise = null;
+const handledMessages = new Set();
+
+const knownChatIds = (process.env.KNOWN_CHAT_IDS || '')
+	.split(/[\n,]+/)
+	.map(line => {
+		const match = line.match(/-?\d+/);
+		return match ? Number(match[0]) : NaN;
+	})
+	.filter(id => !isNaN(id) && id !== 0);
+
+
 
 async function updateCacheShared(doc, sheets) {
 	if (fetchPromise) {
@@ -56,7 +66,6 @@ async function resolveTransactionFromReply(client, chatId, replyToMsgId, depth =
 
 async function main() {
 	console.log(`Обрані аркуші: ${targetSheets.join(', ')}`);
-	console.log('Starting application...');
 
 	const doc = await initGoogleSheets();
 
@@ -64,21 +73,34 @@ async function main() {
 	console.log('Active transactions fetched:', activeTransactions.length);
 
 	setInterval(async () => {
-		console.log('Updating active transactions cache...');
 		await updateCacheShared(doc, targetSheets);
 		console.log('Active transactions fetched:', activeTransactions.length);
 	}, 5 * 60 * 1000);
 
-	const client = await initTelegram();
-	console.log('Telegram client initialized and listening for messages.');
+	const { clients, ourUserIds } = await initTelegramClients();
+	console.log(`Initialized ${clients.length} Telegram clients.`);
 
-	client.addEventHandler(async (event) => {
+	const messageHandler = (client) => async (event) => {
 		const message = event.message;
 		if (!message) return;
 
 		const chatId = Number(message.chatId);
-		const isKnownChat = Object.values(psChatMap).includes(chatId);
+		const isKnownChat = knownChatIds.includes(chatId);
 		if (!isKnownChat) return;
+
+		const msgKey = `${chatId}_${message.id}`;
+		if (handledMessages.has(msgKey)) return;
+		handledMessages.add(msgKey);
+
+		if (handledMessages.size > 2000) {
+			const iterator = handledMessages.values();
+			for (let i = 0; i < 500; i++) {
+				handledMessages.delete(iterator.next().value);
+			}
+		}
+
+		const senderId = message.senderId ? message.senderId.toString() : null;
+		const isFromUs = ourUserIds.includes(senderId);
 
 		let matchedTx = null;
 
@@ -103,9 +125,8 @@ async function main() {
 			matchedTx = await resolveTransactionFromReply(client, chatId, message.replyTo.replyToMsgId);
 		}
 
-		if (message.out) {
+		if (isFromUs) {
 			if (!matchedTx && message.message) {
-				console.log('Unknown transaction. Force fetching cache...');
 				await updateCacheShared(doc, targetSheets);
 
 				for (const tx of activeTransactions) {
@@ -118,11 +139,10 @@ async function main() {
 
 			if (matchedTx) {
 				globalMessageCache.set(message.id, matchedTx);
-				console.log(`Matched OUTGOING message. TransactionID: ${matchedTx.transactionId}`);
+				console.log(`Matched OUTGOING message from team. TransactionID: ${matchedTx.transactionId}`);
 
 				try {
 					await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.rowIndex, 'in progress');
-					console.log('Google Sheet updated to in progress.');
 
 					const txIndex = activeTransactions.findIndex(tx => tx.transactionId === matchedTx.transactionId);
 					if (txIndex !== -1) {
@@ -135,11 +155,10 @@ async function main() {
 		} else {
 			if (matchedTx) {
 				globalMessageCache.set(message.id, matchedTx);
-				console.log(`Matched INCOMING message. TransactionID: ${matchedTx.transactionId}`);
+				console.log(`Matched INCOMING message from PS. TransactionID: ${matchedTx.transactionId}`);
 
 				try {
 					await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.rowIndex, 'update');
-					console.log('Google Sheet updated to update.');
 
 					const txIndex = activeTransactions.findIndex(tx => tx.transactionId === matchedTx.transactionId);
 					if (txIndex !== -1) {
@@ -148,11 +167,13 @@ async function main() {
 				} catch (error) {
 					console.log('Error updating Google Sheet:', error);
 				}
-			} else {
-				console.log('No matching transaction found for this message.');
 			}
 		}
-	}, new NewMessage({}));
+	};
+
+	for (const client of clients) {
+		client.addEventHandler(messageHandler(client), new NewMessage({}));
+	}
 }
 
 main();

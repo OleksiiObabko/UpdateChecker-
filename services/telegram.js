@@ -1,25 +1,31 @@
 const { TelegramClient } = require('telegram');
 const { StringSession } = require('telegram/sessions');
-const input = require('input');
 
-const API_ID = parseInt(process.env.TELEGRAM_API_ID);
-const API_HASH = process.env.TELEGRAM_API_HASH;
-const SESSION_STRING = process.env.TELEGRAM_SESSION || '';
+const apiId1 = parseInt(process.env.API_ID_1);
+const apiHash1 = process.env.API_HASH_1;
+const stringSession1 = new StringSession(process.env.SESSION_1 || '');
 
-async function initTelegram() {
-	const stringSession = new StringSession(SESSION_STRING);
-	const client = new TelegramClient(stringSession, API_ID, API_HASH, {
+const apiId2 = parseInt(process.env.API_ID_2);
+const apiHash2 = process.env.API_HASH_2;
+const stringSession2 = new StringSession(process.env.SESSION_2 || '');
+
+async function initTelegramClients() {
+	const client1 = new TelegramClient(stringSession1, apiId1, apiHash1, {
 		connectionRetries: 5,
 	});
+	await client1.connect();
+	const me1 = await client1.getMe();
 
-	await client.start({
-		phoneNumber: async () => await input.text('Number: '),
-		password: async () => await input.text('Password: '),
-		phoneCode: async () => await input.text('Code: '),
-		onError: (err) => console.log(err),
+	const client2 = new TelegramClient(stringSession2, apiId2, apiHash2, {
+		connectionRetries: 5,
 	});
+	await client2.connect();
+	const me2 = await client2.getMe();
 
-	return client;
+	return {
+		clients: [client1, client2],
+		ourUserIds: [me1.id.toString(), me2.id.toString()]
+	};
 }
 
-module.exports = { initTelegram };
+module.exports = { initTelegramClients };

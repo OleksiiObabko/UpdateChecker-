@@ -18,6 +18,7 @@ async function initGoogleSheets() {
 
 async function fetchActiveTransactions(doc, targetSheets) {
 	const activeTransactions = [];
+	const slackPsList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
 
 	for (const sheetName of targetSheets) {
 		const sheet = doc.sheetsByTitle[sheetName.trim()];
@@ -25,20 +26,37 @@ async function fetchActiveTransactions(doc, targetSheets) {
 
 		const rows = await sheet.getRows();
 		for (const row of rows) {
-			const expectFrom = row.get('Від кого очікуємо відповідь');
-			const status = row.get('Статус');
-			const transactionId = row.get('status.bankTransactionId');
+			const expectFromRaw = row.get('Від кого очікуємо відповідь');
+			const statusRaw = row.get('Статус');
+			const bankTransactionIdRaw = row.get('status.bankTransactionId');
+			const psNameRaw = row.get('ПС');
+			const ourIdRaw = row.get(sheet.headerValues[3]);
 
-			const isStatusValid = !status || status.trim() === '' || status === 'in progress' || status === 'update';
-			const isExpectFromValid = !expectFrom || expectFrom.trim() === '' || expectFrom === 'ПС';
+			const expectFrom = expectFromRaw ? expectFromRaw.toString().trim().toLowerCase() : '';
+			const status = statusRaw ? statusRaw.toString().trim().toLowerCase() : '';
+			const psName = psNameRaw ? psNameRaw.toString().trim().toLowerCase() : '';
 
-			if (isExpectFromValid && isStatusValid && transactionId && transactionId.trim() !== '') {
-				activeTransactions.push({
-					transactionId: transactionId.trim(),
-					psName: row.get('ПС'),
-					sheetName: sheetName.trim(),
-					rowIndex: row.rowNumber
-				});
+			const isStatusValid = status === '' || status === 'in progress' || status === 'update';
+			const isExpectFromValid = expectFrom === '' || expectFrom === 'пс';
+
+			if (isExpectFromValid && isStatusValid) {
+				const isSlackPs = slackPsList.includes(psName);
+				let trackingId = null;
+
+				if (isSlackPs && ourIdRaw && ourIdRaw.toString().trim() !== '') {
+					trackingId = ourIdRaw.toString().trim();
+				} else if (bankTransactionIdRaw && bankTransactionIdRaw.toString().trim() !== '') {
+					trackingId = bankTransactionIdRaw.toString().trim();
+				}
+
+				if (trackingId) {
+					activeTransactions.push({
+						transactionId: trackingId,
+						psName: psNameRaw,
+						sheetName: sheetName.trim(),
+						rowIndex: row.rowNumber
+					});
+				}
 			}
 		}
 	}

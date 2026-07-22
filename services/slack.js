@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { App } = require('@slack/bolt');
-const { initGoogleSheets, fetchActiveTransactions, updateTransactionStatus } = require('./services/googleSheets');
+const { initGoogleSheets, fetchActiveTransactions, updateTransactionStatus } = require('./googleSheets');
 
 let activeTransactions = [];
 const targetSheets = ['Вулик'];
@@ -43,22 +43,31 @@ slackApp.message(async ({ message, client }) => {
 		const parentMessage = threadData.messages[0];
 		if (!parentMessage || !parentMessage.text) return;
 
+		console.log(`PARENT TEXT: ${parentMessage.text}`);
+
 		const match = parentMessage.text.match(/\b(\d+)\b/);
 
 		if (match) {
 			const transactionId = match[1];
+			console.log(`EXTRACTED ID: ${transactionId}`);
 
 			const matchedTx = activeTransactions.find(tx => tx.transactionId === transactionId);
 
 			if (matchedTx) {
-				console.log(`Matched INCOMING Slack message for TX: ${transactionId}`);
+				console.log(`MATCHED TX: ${transactionId}, Updating...`);
 				const doc = await initGoogleSheets();
 				await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.rowIndex, 'update');
 				matchedTx.status = 'update';
+				console.log(`UPDATED TX: ${transactionId}`);
+			} else {
+				console.log(`NOT FOUND IN CACHE: ${transactionId}`);
+				console.log('CURRENT CACHE:', activeTransactions);
 			}
+		} else {
+			console.log('NO ID MATCHED IN PARENT TEXT');
 		}
 	} catch (error) {
-		console.error(error);
+		console.error('SLACK API ERROR:', error);
 	}
 });
 

@@ -1,23 +1,16 @@
 require('dotenv').config();
-const { initGoogleSheets, fetchActiveTransactions, updateTransactionStatus } = require('./services/googleSheets');
-const { initTelegramClients } = require('./services/telegram');
-const { NewMessage } = require('telegram/events');
+const { App } = require('@slack/bolt');
+const {
+	initGoogleSheets,
+	fetchActiveTransactions,
+	updateTransactionStatus,
+	initExternalSheets,
+	checkExternalPsUpdates
+} = require('./services/googleSheets');
 
 let activeTransactions = [];
-let globalMessageCache = new Map();
 const targetSheets = ['Вулик'];
 let fetchPromise = null;
-const handledMessages = new Set();
-
-const knownChatIds = (process.env.KNOWN_CHAT_IDS || '')
-	.split(/[\n,]+/)
-	.map(line => {
-		const match = line.match(/-?\d+/);
-		return match ? Number(match[0]) : NaN;
-	})
-	.filter(id => !isNaN(id) && id !== 0);
-
-
 
 async function updateCacheShared(doc, sheets) {
 	if (fetchPromise) {
@@ -34,146 +27,68 @@ async function updateCacheShared(doc, sheets) {
 	return fetchPromise;
 }
 
-async function resolveTransactionFromReply(client, chatId, replyToMsgId, depth = 0) {
-	if (depth > 3) return null;
+const slackApp = new App({
+	token: process.env.SLACK_BOT_TOKEN,
+	appToken: process.env.SLACK_APP_TOKEN,
+	socketMode: true
+});
 
-	if (globalMessageCache.has(replyToMsgId)) {
-		return globalMessageCache.get(replyToMsgId);
-	}
+slackApp.message(async ({ message, client }) => {
+	if (message.subtype || !message.thread_ts || message.ts === message.thread_ts) return;
+
+	const isFromUs = message.user === process.env.OUR_SLACK_USER_ID;
+	if (isFromUs) return;
 
 	try {
-		const msgs = await client.getMessages(chatId, { ids: [replyToMsgId] });
-		if (msgs && msgs.length > 0) {
-			const msg = msgs[0];
-			if (msg && msg.message) {
-				const allKnownTxs = [...activeTransactions, ...Array.from(globalMessageCache.values())];
-				for (const tx of allKnownTxs) {
-					if (msg.message.includes(tx.transactionId)) {
-						globalMessageCache.set(replyToMsgId, tx);
-						return tx;
-					}
-				}
-			}
-			if (msg && msg.replyTo) {
-				return await resolveTransactionFromReply(client, chatId, msg.replyTo.replyToMsgId, depth + 1);
+		const threadData = await client.conversations.replies({
+			channel: message.channel,
+			ts: message.thread_ts,
+			limit: 1
+		});
+
+		const parentMessage = threadData.messages[0];
+		if (!parentMessage || !parentMessage.text) return;
+
+		const match = parentMessage.text.match(/\b(\d+)\b/);
+
+		if (match) {
+			const transactionId = match[1];
+			const matchedTx = activeTransactions.find(tx => tx.transactionId === transactionId);
+
+			if (matchedTx) {
+				console.log(`Matched INCOMING Slack message for TX: ${transactionId}`);
+				const doc = await initGoogleSheets();
+				await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.rowIndex, 'update');
+				matchedTx.status = 'update';
 			}
 		}
-	} catch (err) {
-		console.log('Error fetching original message:', err);
+	} catch (error) {
+		console.error(error);
 	}
-	return null;
-}
+});
 
 async function main() {
-	console.log(`Обрані аркуші: ${targetSheets.join(', ')}`);
+	const mainDoc = await initGoogleSheets();
+	const externalDoc = await initExternalSheets();
 
-	const doc = await initGoogleSheets();
-
-	await updateCacheShared(doc, targetSheets);
-	console.log('Active transactions fetched:', activeTransactions.length);
+	await updateCacheShared(mainDoc, targetSheets);
 
 	setInterval(async () => {
-		await updateCacheShared(doc, targetSheets);
-		console.log('Active transactions fetched:', activeTransactions.length);
+		await updateCacheShared(mainDoc, targetSheets);
 	}, 5 * 60 * 1000);
 
-	const { clients, ourUserIds } = await initTelegramClients();
-	console.log(`Initialized ${clients.length} Telegram clients.`);
-
-	const messageHandler = (client) => async (event) => {
-		const message = event.message;
-		if (!message) return;
-
-		const chatId = Number(message.chatId);
-		const isKnownChat = knownChatIds.includes(chatId);
-		if (!isKnownChat) return;
-
-		const msgKey = `${chatId}_${message.id}`;
-		if (handledMessages.has(msgKey)) return;
-		handledMessages.add(msgKey);
-
-		if (handledMessages.size > 2000) {
-			const iterator = handledMessages.values();
-			for (let i = 0; i < 500; i++) {
-				handledMessages.delete(iterator.next().value);
+	setInterval(async () => {
+		if (activeTransactions.length > 0) {
+			try {
+				await checkExternalPsUpdates(mainDoc, externalDoc, activeTransactions);
+			} catch (error) {
+				console.error('Error checking external PS:', error);
 			}
 		}
+	}, 20 * 60 * 1000);
 
-		const senderId = message.senderId ? message.senderId.toString() : null;
-		const isFromUs = ourUserIds.includes(senderId);
-
-		let matchedTx = null;
-
-		if (!matchedTx && message.message) {
-			for (const [msgId, tx] of globalMessageCache.entries()) {
-				if (message.message.includes(tx.transactionId)) {
-					matchedTx = tx;
-					break;
-				}
-			}
-			if (!matchedTx) {
-				for (const tx of activeTransactions) {
-					if (message.message.includes(tx.transactionId)) {
-						matchedTx = tx;
-						break;
-					}
-				}
-			}
-		}
-
-		if (!matchedTx && message.replyTo) {
-			matchedTx = await resolveTransactionFromReply(client, chatId, message.replyTo.replyToMsgId);
-		}
-
-		if (isFromUs) {
-			if (!matchedTx && message.message) {
-				await updateCacheShared(doc, targetSheets);
-
-				for (const tx of activeTransactions) {
-					if (message.message.includes(tx.transactionId)) {
-						matchedTx = tx;
-						break;
-					}
-				}
-			}
-
-			if (matchedTx) {
-				globalMessageCache.set(message.id, matchedTx);
-				console.log(`Matched OUTGOING message from team. TransactionID: ${matchedTx.transactionId}`);
-
-				try {
-					await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.rowIndex, 'in progress');
-
-					const txIndex = activeTransactions.findIndex(tx => tx.transactionId === matchedTx.transactionId);
-					if (txIndex !== -1) {
-						activeTransactions[txIndex].status = 'in progress';
-					}
-				} catch (error) {
-					console.log('Error updating status:', error);
-				}
-			}
-		} else {
-			if (matchedTx) {
-				globalMessageCache.set(message.id, matchedTx);
-				console.log(`Matched INCOMING message from PS. TransactionID: ${matchedTx.transactionId}`);
-
-				try {
-					await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.rowIndex, 'update');
-
-					const txIndex = activeTransactions.findIndex(tx => tx.transactionId === matchedTx.transactionId);
-					if (txIndex !== -1) {
-						activeTransactions[txIndex].status = 'update';
-					}
-				} catch (error) {
-					console.log('Error updating Google Sheet:', error);
-				}
-			}
-		}
-	};
-
-	for (const client of clients) {
-		client.addEventHandler(messageHandler(client), new NewMessage({}));
-	}
+	await slackApp.start();
+	console.log('Slack bot started');
 }
 
 main();

@@ -1,5 +1,4 @@
 require('dotenv').config();
-const prompts = require('prompts');
 const { initGoogleSheets, fetchActiveTransactions, updateTransactionStatus } = require('./services/googleSheets');
 const { initTelegram } = require('./services/telegram');
 const psChatMap = require('./chatMap.json');
@@ -7,7 +6,7 @@ const { NewMessage } = require('telegram/events');
 
 let activeTransactions = [];
 let globalMessageCache = new Map();
-let targetSheets = [];
+const targetSheets = ['Дракони', 'Лелеки', 'Корови', 'Вулик', 'Джира', 'Кити', 'Нексус'];
 let fetchPromise = null;
 
 async function updateCacheShared(doc, sheets) {
@@ -56,23 +55,6 @@ async function resolveTransactionFromReply(client, chatId, replyToMsgId, depth =
 }
 
 async function main() {
-	const allAvailableSheets = ['Дракони', 'Лелеки', 'Корови', 'Вулик', 'Джира', 'Кити', 'Нексус'];
-
-	const response = await prompts({
-		type: 'multiselect',
-		name: 'selectedSheets',
-		message: 'Оберіть аркуші для моніторингу (Стрілки - навігація, Пробіл - вибір, Enter - підтвердити):',
-		choices: allAvailableSheets.map(sheet => ({ title: sheet, value: sheet })),
-		min: 1
-	});
-
-	if (!response.selectedSheets) {
-		console.log('Вихід: аркуші не обрано.');
-		process.exit(0);
-	}
-
-	targetSheets = response.selectedSheets;
-
 	console.log(`Обрані аркуші: ${targetSheets.join(', ')}`);
 	console.log('Starting application...');
 

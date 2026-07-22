@@ -8,6 +8,22 @@ const { NewMessage } = require('telegram/events');
 let activeTransactions = [];
 let globalMessageCache = new Map();
 let targetSheets = [];
+let fetchPromise = null;
+
+async function updateCacheShared(doc, sheets) {
+	if (fetchPromise) {
+		return fetchPromise;
+	}
+	fetchPromise = fetchActiveTransactions(doc, sheets)
+		.then(txs => {
+			activeTransactions = txs;
+			return txs;
+		})
+		.finally(() => {
+			fetchPromise = null;
+		});
+	return fetchPromise;
+}
 
 async function resolveTransactionFromReply(client, chatId, replyToMsgId, depth = 0) {
 	if (depth > 3) return null;
@@ -40,7 +56,7 @@ async function resolveTransactionFromReply(client, chatId, replyToMsgId, depth =
 }
 
 async function main() {
-	const allAvailableSheets = ['Дракони', 'Лелеки', 'Корови', 'Вулик', 'Джира', 'КитиЛевіафан', 'Нексус'];
+	const allAvailableSheets = ['Дракони', 'Лелеки', 'Корови', 'Вулик', 'Джира', 'Кити', 'Нексус'];
 
 	const response = await prompts({
 		type: 'multiselect',
@@ -62,12 +78,12 @@ async function main() {
 
 	const doc = await initGoogleSheets();
 
-	activeTransactions = await fetchActiveTransactions(doc, targetSheets);
+	await updateCacheShared(doc, targetSheets);
 	console.log('Active transactions fetched:', activeTransactions.length);
 
 	setInterval(async () => {
 		console.log('Updating active transactions cache...');
-		activeTransactions = await fetchActiveTransactions(doc, targetSheets);
+		await updateCacheShared(doc, targetSheets);
 		console.log('Active transactions fetched:', activeTransactions.length);
 	}, 5 * 60 * 1000);
 
@@ -106,6 +122,18 @@ async function main() {
 		}
 
 		if (message.out) {
+			if (!matchedTx && message.message) {
+				console.log('Unknown transaction. Force fetching cache...');
+				await updateCacheShared(doc, targetSheets);
+
+				for (const tx of activeTransactions) {
+					if (message.message.includes(tx.transactionId)) {
+						matchedTx = tx;
+						break;
+					}
+				}
+			}
+
 			if (matchedTx) {
 				globalMessageCache.set(message.id, matchedTx);
 				console.log(`Matched OUTGOING message. TransactionID: ${matchedTx.transactionId}`);
@@ -114,23 +142,12 @@ async function main() {
 					await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.rowIndex, 'in progress');
 					console.log('Google Sheet updated to in progress.');
 
-					console.log('Force updating active transactions cache...');
-					activeTransactions = await fetchActiveTransactions(doc, targetSheets);
-					console.log('Active transactions fetched:', activeTransactions.length);
-				} catch (error) {
-					console.log('Error reverting status:', error);
-				}
-			} else {
-				console.log('Force updating active transactions cache after unknown outgoing message...');
-				activeTransactions = await fetchActiveTransactions(doc, targetSheets);
-				console.log('Active transactions fetched:', activeTransactions.length);
-
-				for (const tx of activeTransactions) {
-					if (message.message && message.message.includes(tx.transactionId)) {
-						globalMessageCache.set(message.id, tx);
-						console.log(`Saved outgoing message to cache. MsgID: ${message.id}, TransactionID: ${tx.transactionId}`);
-						break;
+					const txIndex = activeTransactions.findIndex(tx => tx.transactionId === matchedTx.transactionId);
+					if (txIndex !== -1) {
+						activeTransactions[txIndex].status = 'in progress';
 					}
+				} catch (error) {
+					console.log('Error updating status:', error);
 				}
 			}
 		} else {
@@ -141,6 +158,11 @@ async function main() {
 				try {
 					await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.rowIndex, 'update');
 					console.log('Google Sheet updated to update.');
+
+					const txIndex = activeTransactions.findIndex(tx => tx.transactionId === matchedTx.transactionId);
+					if (txIndex !== -1) {
+						activeTransactions[txIndex].status = 'update';
+					}
 				} catch (error) {
 					console.log('Error updating Google Sheet:', error);
 				}

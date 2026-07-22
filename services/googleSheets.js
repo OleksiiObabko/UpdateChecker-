@@ -29,7 +29,10 @@ async function fetchActiveTransactions(doc, targetSheets) {
 			const status = row.get('Статус');
 			const transactionId = row.get('status.bankTransactionId');
 
-			if (expectFrom === 'ПС' && (status === 'in progress' || status === 'update') && transactionId && transactionId.trim() !== '') {
+			const isStatusValid = !status || status.trim() === '' || status === 'in progress' || status === 'update';
+			const isExpectFromValid = !expectFrom || expectFrom.trim() === '' || expectFrom === 'ПС';
+
+			if (isExpectFromValid && isStatusValid && transactionId && transactionId.trim() !== '') {
 				activeTransactions.push({
 					transactionId: transactionId.trim(),
 					psName: row.get('ПС'),

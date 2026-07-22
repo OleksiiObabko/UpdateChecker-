@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { App } = require('@slack/bolt');
+const prompts = require('prompts');
 const {
 	initGoogleSheets,
 	fetchActiveTransactions,
@@ -7,10 +8,51 @@ const {
 	initExternalSheets,
 	checkExternalPsUpdates
 } = require('./services/googleSheets');
+const { initTelegramClients } = require('./services/telegram');
 
 let activeTransactions = [];
-const targetSheets = ['Вулик'];
+let targetSheets = [];
 let fetchPromise = null;
+let cacheCountdown = 300;
+let psCountdown = 600;
+
+const originalLog = console.log;
+console.log = function (...args) {
+	process.stdout.write('\x1b[2K\r');
+	originalLog.apply(console, args);
+};
+
+const originalError = console.error;
+console.error = function (...args) {
+	process.stdout.write('\x1b[2K\r');
+	originalError.apply(console, args);
+};
+
+async function promptSheetSelection() {
+	const response = await prompts({
+		type: 'select',
+		name: 'sheet',
+		message: 'Оберіть аркуш для моніторингу:',
+		choices: [
+			{ title: 'Корівки', value: 'Корівки' },
+			{ title: 'Вулик', value: 'Вулик' },
+			{ title: 'all INR', value: 'all INR' },
+			{ title: 'ASAP INR', value: 'ASAP INR' },
+			{ title: 'Bulk INR', value: 'Bulk INR' },
+			{ title: 'NPR', value: 'NPR' },
+			{ title: 'MAD', value: 'MAD' },
+			{ title: 'LKR', value: 'LKR' },
+			{ title: 'PKR', value: 'PKR' }
+		],
+		initial: 0
+	});
+
+	if (!response.sheet) {
+		process.exit(0);
+	}
+
+	targetSheets = [response.sheet];
+}
 
 async function updateCacheShared(doc, sheets) {
 	if (fetchPromise) {
@@ -56,9 +98,9 @@ slackApp.message(async ({ message, client }) => {
 			const matchedTx = activeTransactions.find(tx => tx.transactionId === transactionId);
 
 			if (matchedTx) {
-				console.log(`Matched INCOMING Slack message for TX: ${transactionId}`);
+				console.log(`Апдейт Slack: ID ${transactionId}, ПС ${matchedTx.psName}, Зона ${matchedTx.sheetName}`);
 				const doc = await initGoogleSheets();
-				await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.rowIndex, 'update');
+				await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, 'update');
 				matchedTx.status = 'update';
 			}
 		}
@@ -68,27 +110,58 @@ slackApp.message(async ({ message, client }) => {
 });
 
 async function main() {
+	await promptSheetSelection();
+
 	const mainDoc = await initGoogleSheets();
 	const externalDoc = await initExternalSheets();
 
+	try {
+		await initTelegramClients();
+	} catch (error) {
+		console.error(error);
+	}
+
 	await updateCacheShared(mainDoc, targetSheets);
 
-	setInterval(async () => {
-		await updateCacheShared(mainDoc, targetSheets);
-	}, 5 * 60 * 1000);
+	console.log(`\nЗапуск моніторингу для аркуша: ${targetSheets[0]}`);
+	console.log(`Активних запитів знайдено: ${activeTransactions.length}\n`);
 
 	setInterval(async () => {
-		if (activeTransactions.length > 0) {
+		cacheCountdown--;
+		psCountdown--;
+
+		if (cacheCountdown <= 0) {
+			cacheCountdown = 300;
 			try {
-				await checkExternalPsUpdates(mainDoc, externalDoc, activeTransactions);
+				await updateCacheShared(mainDoc, targetSheets);
+				const now = new Date().toLocaleTimeString('uk-UA');
+				console.log(`[${now}] Кеш оновлено. Активних запитів: ${activeTransactions.length}`);
 			} catch (error) {
-				console.error('Error checking external PS:', error);
+				console.error('Помилка оновлення кешу:', error.message);
 			}
 		}
-	}, 20 * 60 * 1000);
+
+		if (psCountdown <= 0) {
+			psCountdown = 300;
+			if (activeTransactions.length > 0) {
+				try {
+					await checkExternalPsUpdates(mainDoc, externalDoc, activeTransactions);
+				} catch (error) {
+					console.error(error);
+				}
+			}
+		}
+
+		const cM = Math.floor(cacheCountdown / 60).toString().padStart(2, '0');
+		const cS = (cacheCountdown % 60).toString().padStart(2, '0');
+
+		const pM = Math.floor(psCountdown / 60).toString().padStart(2, '0');
+		const pS = (psCountdown % 60).toString().padStart(2, '0');
+
+		process.stdout.write(`\x1b[2K\rОновлення кешу через: ${cM}:${cS} | Перевірка ПС через: ${pM}:${pS}`);
+	}, 1000);
 
 	await slackApp.start();
-	console.log('Slack bot started');
 }
 
 main();

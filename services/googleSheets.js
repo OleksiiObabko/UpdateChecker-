@@ -4,26 +4,32 @@ const credentials = require('../credentials.json');
 
 const SHEET_ID = process.env.SHEET_ID;
 
-async function initGoogleSheets() {
-	const serviceAccountAuth = new JWT({
+// Валюта → список аркушів зовнішньої книги, де може лежати транзакція.
+// Для INR є кілька кандидатів — перевіряються по черзі, поки не знайдеться збіг.
+const CURRENCY_SHEET_MAP = {
+	'INR': ['all INR', 'ASAP INR', 'Bulk INR', 'INR induvidual'],
+	'NPR': ['NPR'],
+	'MAD': ['MAD'],
+	'LKR': ['LKR'],
+	'PKR': ['PKR']
+};
+
+function createServiceAccountAuth() {
+	return new JWT({
 		email: credentials.client_email,
 		key: credentials.private_key,
 		scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 	});
+}
 
-	const doc = new GoogleSpreadsheet(SHEET_ID, serviceAccountAuth);
+async function initGoogleSheets() {
+	const doc = new GoogleSpreadsheet(SHEET_ID, createServiceAccountAuth());
 	await doc.loadInfo();
 	return doc;
 }
 
 async function initExternalSheets() {
-	const serviceAccountAuth = new JWT({
-		email: credentials.client_email,
-		key: credentials.private_key,
-		scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-	});
-
-	const doc = new GoogleSpreadsheet(process.env.EXTERNAL_PS_SHEET_ID, serviceAccountAuth);
+	const doc = new GoogleSpreadsheet(process.env.EXTERNAL_PS_SHEET_ID, createServiceAccountAuth());
 	await doc.loadInfo();
 	return doc;
 }
@@ -43,10 +49,13 @@ async function fetchActiveTransactions(doc, targetSheets) {
 			const bankTransactionIdRaw = row.get('status.bankTransactionId');
 			const psNameRaw = row.get('ПС');
 			const ourIdRaw = row.get(sheet.headerValues[3]);
+			// Колонка C — Валюта. Якщо назва заголовка інша, підстрахуємось позицією.
+			const currencyRaw = row.get('Валюта') || row.get(sheet.headerValues[2]);
 
 			const expectFrom = expectFromRaw ? expectFromRaw.toString().trim().toLowerCase() : '';
 			const status = statusRaw ? statusRaw.toString().trim().toLowerCase() : '';
 			const psName = psNameRaw ? psNameRaw.toString().trim().toLowerCase() : '';
+			const currency = currencyRaw ? currencyRaw.toString().trim().toUpperCase() : null;
 
 			const isStatusValid = status === '' || status === 'in progress' || status === 'update';
 			const isExpectFromValid = expectFrom === '' || expectFrom === 'пс';
@@ -66,8 +75,8 @@ async function fetchActiveTransactions(doc, targetSheets) {
 						transactionId: trackingId,
 						psName: psNameRaw,
 						sheetName: sheetName.trim(),
-						rowIndex: row.rowNumber,
-						status: status || 'in progress'
+						status: status || 'in progress',
+						currency
 					});
 				}
 			}
@@ -76,58 +85,102 @@ async function fetchActiveTransactions(doc, targetSheets) {
 	return activeTransactions;
 }
 
-async function updateTransactionStatus(doc, sheetName, rowIndex, newStatus) {
+async function updateTransactionStatus(doc, sheetName, transactionId, newStatus) {
 	const sheet = doc.sheetsByTitle[sheetName];
-	const rows = await sheet.getRows({ offset: rowIndex - 2, limit: 1 });
-	const row = rows[0];
+	if (!sheet) {
+		console.error(`Аркуш "${sheetName}" не знайдено в основній таблиці`);
+		return false;
+	}
 
+	const rows = await sheet.getRows();
+
+	const row = rows.find(r => {
+		const bankId = r.get('status.bankTransactionId');
+		const ourId = r.get(sheet.headerValues[3]);
+		return (bankId && bankId.toString().trim() === transactionId.toString().trim()) ||
+			(ourId && ourId.toString().trim() === transactionId.toString().trim());
+	});
+
+	if (!row) {
+		console.error(`Рядок для ID ${transactionId} не знайдено в "${sheetName}" (видалений/змінений?)`);
+		return false;
+	}
+
+	// Звір з реальною назвою колонки статусу в таблиці — тут очікується 'Статус'
 	row.set('Статус', newStatus);
 	await row.save();
+	return true;
 }
 
-async function checkExternalPsUpdates(mainDoc, externalDoc, activeTransactions) {
-	const psNamesTarget = process.env.EXTERNAL_PS_NAMES
-		? process.env.EXTERNAL_PS_NAMES.split(',').map(name => name.trim().toLowerCase())
-		: [];
+async function findTransactionInExternalSheets(externalDoc, tx, sheetCache) {
+	const candidates = CURRENCY_SHEET_MAP[tx.currency] || [];
 
-	const relevantTxs = activeTransactions.filter(
-		tx => psNamesTarget.includes(tx.psName.trim().toLowerCase()) && tx.status === 'in progress'
-	);
+	if (candidates.length === 0) {
+		console.log(`[ДЕБАГ] Невідома/відсутня валюта для ${tx.transactionId}: "${tx.currency}"`);
+		return null;
+	}
 
-	if (relevantTxs.length === 0) return;
-
-	const txMap = new Map(relevantTxs.map(tx => [tx.transactionId, tx]));
-	const targetSheets = ['all INR', 'ASAP INR', 'Bulk INR', 'NPR', 'MAD', 'LKR', 'PKR'];
-	const fetchLimit = 300;
-
-	for (const sheetName of targetSheets) {
+	for (const sheetName of candidates) {
 		const sheet = externalDoc.sheetsByTitle[sheetName];
 		if (!sheet) continue;
 
-		const rowCount = sheet.rowCount;
-		const offset = Math.max(0, rowCount - fetchLimit - 1);
+		if (!sheetCache.has(sheetName)) {
+			sheetCache.set(sheetName, await sheet.getRows());
+		}
+		const rows = sheetCache.get(sheetName);
 
-		const rows = await sheet.getRows({ offset, limit: fetchLimit });
+		// Збираємо ВСІ збіги (транзакція могла подаватись кілька разів)
+		const matches = rows.filter(r => {
+			const ufId = r.get('UF ID');
+			const orderId = r.get('Order ID');
+			return (ufId && ufId.toString().trim() === tx.transactionId.toString().trim()) ||
+				(orderId && orderId.toString().trim() === tx.transactionId.toString().trim());
+		});
 
-		for (const row of rows) {
-			const orderIdRaw = row.get('OrderID');
-			const statusRaw = row.get('Status');
+		if (matches.length === 0) continue;
 
-			if (!orderIdRaw) continue;
+		if (matches.length > 1) {
+			console.log(`[ДЕБАГ] ${tx.transactionId} подавалась ${matches.length} раз(и) в "${sheetName}", беремо останнє звернення (рядок ${matches[matches.length - 1].rowNumber})`);
+		}
 
-			const orderId = orderIdRaw.toString().trim();
-			const status = statusRaw ? statusRaw.toString().trim().toLowerCase() : '';
+		// Останній рядок у таблиці = останнє (найновіше) звернення
+		const row = matches[matches.length - 1];
+		return { row, sheetName };
+	}
+	return null;
+}
 
-			if (txMap.has(orderId) && status !== '' && status !== 'в работе') {
-				const matchedTx = txMap.get(orderId);
+async function checkExternalPsUpdates(doc, externalDoc, transactions) {
+	try {
+		const externalPsNames = process.env.EXTERNAL_PS_NAMES
+			? process.env.EXTERNAL_PS_NAMES.split(',').map(s => s.trim().toLowerCase())
+			: [];
 
-				await updateTransactionStatus(mainDoc, matchedTx.sheetName, matchedTx.rowIndex, 'update');
-				matchedTx.status = 'update';
-				txMap.delete(orderId);
+		const activeTransactions = transactions.filter(tx =>
+			externalPsNames.includes(tx.psName.toLowerCase()) && tx.status.toLowerCase() === 'in progress'
+		);
 
-				console.log(`Updated external PS transaction: ${orderId}`);
+		console.log(`[ДЕБАГ] Активних транзакцій загалом: ${transactions.length}. З них підходять під EXTERNAL_PS_NAMES та 'in progress': ${activeTransactions.length}`);
+
+		const sheetCache = new Map();
+
+		for (const tx of activeTransactions) {
+			const found = await findTransactionInExternalSheets(externalDoc, tx, sheetCache);
+			if (!found) continue;
+
+			const rowStatus = found.row.get('Status') ? found.row.get('Status').toString().trim().toLowerCase() : '';
+			console.log(`[ДЕБАГ] ${tx.transactionId} (${tx.currency}) знайдено в "${found.sheetName}", статус: "${rowStatus}"`);
+
+			const NON_FINAL_STATUSES = ['', 'в работе'];
+
+			if (!NON_FINAL_STATUSES.includes(rowStatus)) {
+				await updateTransactionStatus(doc, tx.sheetName, tx.transactionId, 'update');
+				tx.status = 'update';
+				console.log(`Статус транзакції ${tx.transactionId} змінено на update`);
 			}
 		}
+	} catch (error) {
+		console.error(error.message);
 	}
 }
 

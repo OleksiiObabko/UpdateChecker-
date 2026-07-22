@@ -56,7 +56,7 @@ slackApp.message(async ({ message, client }) => {
 			if (matchedTx) {
 				console.log(`MATCHED TX: ${transactionId}, Updating...`);
 				const doc = await initGoogleSheets();
-				await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.rowIndex, 'update');
+				await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, 'update');
 				matchedTx.status = 'update';
 				console.log(`UPDATED TX: ${transactionId}`);
 			} else {

@@ -1,86 +1,52 @@
-require('dotenv').config();
 const { App } = require('@slack/bolt');
-const { initGoogleSheets, fetchActiveTransactions, updateTransactionStatus } = require('./googleSheets');
+const state = require('./state');
+const { initGoogleSheets, updateTransactionStatus } = require('./googleSheets');
+const { logStatusChange } = require('./statusLog');
 
-let activeTransactions = [];
-const targetSheets = ['Вулик'];
-let fetchPromise = null;
+function createSlackApp() {
+	const slackApp = new App({
+		token: process.env.SLACK_BOT_TOKEN,
+		appToken: process.env.SLACK_APP_TOKEN,
+		socketMode: true
+	});
 
-async function updateCacheShared(doc, sheets) {
-	if (fetchPromise) {
-		return fetchPromise;
-	}
-	fetchPromise = fetchActiveTransactions(doc, sheets)
-		.then(txs => {
-			activeTransactions = txs;
-			return txs;
-		})
-		.finally(() => {
-			fetchPromise = null;
-		});
-	return fetchPromise;
-}
+	slackApp.message(async ({ message, client }) => {
+		if (message.subtype || !message.thread_ts || message.ts === message.thread_ts) return;
 
-const slackApp = new App({
-	token: process.env.SLACK_BOT_TOKEN,
-	appToken: process.env.SLACK_APP_TOKEN,
-	socketMode: true
-});
+		const isFromUs = message.user === process.env.OUR_SLACK_USER_ID;
+		if (isFromUs) return;
 
-slackApp.message(async ({ message, client }) => {
-	if (message.subtype || !message.thread_ts || message.ts === message.thread_ts) return;
+		try {
+			const threadData = await client.conversations.replies({
+				channel: message.channel,
+				ts: message.thread_ts,
+				limit: 1
+			});
 
-	const isFromUs = message.user === process.env.OUR_SLACK_USER_ID;
-	if (isFromUs) return;
+			const parentMessage = threadData.messages[0];
+			if (!parentMessage || !parentMessage.text) return;
 
-	try {
-		const threadData = await client.conversations.replies({
-			channel: message.channel,
-			ts: message.thread_ts,
-			limit: 1
-		});
+			const match = parentMessage.text.match(/\b(\d+)\b/);
+			if (!match) return;
 
-		const parentMessage = threadData.messages[0];
-		if (!parentMessage || !parentMessage.text) return;
-
-		console.log(`PARENT TEXT: ${parentMessage.text}`);
-
-		const match = parentMessage.text.match(/\b(\d+)\b/);
-
-		if (match) {
 			const transactionId = match[1];
-			console.log(`EXTRACTED ID: ${transactionId}`);
-
-			const matchedTx = activeTransactions.find(tx => tx.transactionId === transactionId);
+			const matchedTx = state.activeTransactions.find(tx => tx.transactionId === transactionId);
 
 			if (matchedTx) {
-				console.log(`MATCHED TX: ${transactionId}, Updating...`);
+				const previousStatus = matchedTx.status;
 				const doc = await initGoogleSheets();
-				await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, 'update');
-				matchedTx.status = 'update';
-				console.log(`UPDATED TX: ${transactionId}`);
-			} else {
-				console.log(`NOT FOUND IN CACHE: ${transactionId}`);
-				console.log('CURRENT CACHE:', activeTransactions);
+				const ok = await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, 'update');
+				if (ok) {
+					logStatusChange('Slack', matchedTx, previousStatus, 'update');
+					matchedTx.status = 'update';
+				}
 			}
-		} else {
-			console.log('NO ID MATCHED IN PARENT TEXT');
+		} catch (error) {
+			console.error('Помилка обробки Slack-повідомлення:', error);
 		}
-	} catch (error) {
-		console.error('SLACK API ERROR:', error);
-	}
-});
+	});
 
-async function main() {
-	const doc = await initGoogleSheets();
-	await updateCacheShared(doc, targetSheets);
-
-	setInterval(async () => {
-		await updateCacheShared(doc, targetSheets);
-	}, 5 * 60 * 1000);
-
-	await slackApp.start();
-	console.log('Slack bot started');
+	return slackApp;
 }
 
-main();
+module.exports = { createSlackApp };

@@ -1,6 +1,7 @@
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 const credentials = require('../credentials.json');
+const { logStatusChange } = require('./statusLog');
 
 const SHEET_ID = process.env.SHEET_ID;
 
@@ -36,6 +37,7 @@ async function initExternalSheets() {
 
 async function fetchActiveTransactions(doc, targetSheets) {
 	const activeTransactions = [];
+	const seenTransactionIds = new Set();
 	const slackPsList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
 
 	for (const sheetName of targetSheets) {
@@ -70,6 +72,13 @@ async function fetchActiveTransactions(doc, targetSheets) {
 				}
 
 				if (trackingId) {
+					// Захист від дубльованих рядків з однаковим ID у таблиці
+					if (seenTransactionIds.has(trackingId)) {
+						console.error(`Дублікат ID у "${sheetName.trim()}", рядок ${row.rowNumber}: "${trackingId}" вже додано раніше — пропущено`);
+						continue;
+					}
+					seenTransactionIds.add(trackingId);
+
 					activeTransactions.push({
 						transactionId: trackingId,
 						psName: psNameRaw,
@@ -81,6 +90,7 @@ async function fetchActiveTransactions(doc, targetSheets) {
 			}
 		}
 	}
+
 	return activeTransactions;
 }
 
@@ -107,7 +117,6 @@ async function updateTransactionStatus(doc, sheetName, transactionId, newStatus)
 
 	row.set('Статус', newStatus);
 	await row.save();
-	console.log(`Транзакція ${transactionId} (${sheetName}): статус змінено на "${newStatus}"`);
 	return true;
 }
 
@@ -186,11 +195,12 @@ async function checkExternalPsUpdates(doc, externalDoc, transactions) {
 				continue;
 			}
 
+			const previousStatus = tx.status;
 			row.set('Статус', 'update');
 			await row.save();
 			tx.status = 'update';
 			updatedCount++;
-			console.log(`Транзакція ${tx.transactionId} (${tx.sheetName}, ${tx.currency}) → update. Статус ПС: "${rowStatus}"`);
+			logStatusChange('зовнішня таблиця', tx, previousStatus, 'update');
 		}
 
 		if (updatedCount > 0) {

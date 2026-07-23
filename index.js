@@ -69,6 +69,16 @@ async function main() {
 		console.error('Помилка ініціалізації Telegram:', error);
 	}
 
+	if (state.activeTransactions.length > 0) {
+		console.log(`[Ініціалізація] Виконую першу перевірку зовнішньої таблиці ПС...`);
+		try {
+			await checkExternalPsUpdates(mainDoc, externalDoc, state.activeTransactions);
+		} catch (error) {
+			console.error('Помилка першої перевірки ПС:', error);
+		}
+	}
+
+	// 3. Запуск таймерів
 	setInterval(async () => {
 		cacheCountdown--;
 		psCountdown--;

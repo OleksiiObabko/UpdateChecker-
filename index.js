@@ -8,12 +8,13 @@ const {
 	checkExternalPsUpdates
 } = require('./services/googleSheets');
 const { initTelegramClients } = require('./services/telegram');
-const { setupTelegram } = require('./services/telegramHandler');
+const { setupTelegram, runTelegramBackfill } = require('./services/telegramHandler');
 const { createSlackApp, runSlackBackfill } = require('./services/slack');
 
 let targetSheets = [];
 let cacheCountdown = 300;
-let psCountdown = 10;
+let psCountdown = 345;
+let backfillCountdown = 630;
 
 const originalLog = console.log;
 console.log = function (...args) {
@@ -27,26 +28,7 @@ console.error = function (...args) {
 	originalError.apply(console, args);
 };
 
-const umamaPs = process.env.EXTERNAL_PS_NAMES ? process.env.EXTERNAL_PS_NAMES.split(',').map(s => s.trim().toLowerCase()) : [];
-const slackPs = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
-const tgPs = (process.env.KNOWN_CHAT_IDS || '').split('\n').map(line => {
-	const match = line.match(/\(([^)]+)\)/);
-	return match ? match[1].trim().toLowerCase() : null;
-}).filter(Boolean);
-const monitoredPsSet = new Set([...umamaPs, ...slackPs, ...tgPs]);
-
-function printReport() {
-	const inProgressAll = state.activeTransactions.filter(tx => tx.status === 'in progress').length;
-	const inProgressMonitored = state.activeTransactions.filter(tx =>
-		tx.status === 'in progress' && monitoredPsSet.has((tx.psName || '').toString().trim().toLowerCase())
-	).length;
-
-	console.log(`\n--- ЗВІТ ---`);
-	console.log(`Надано апдейтів (разом): ${state.stats.updatesProvided}`);
-	console.log(`Запитів in progress (незалежно від ПС): ${inProgressAll}`);
-	console.log(`Запитів in progress (від ПС які моніторимо): ${inProgressMonitored}`);
-	console.log(`------------\n`);
-}
+const ALL_SHEETS = ['Кити', 'Омнік', 'Лелеки', 'Фікси', 'Дракони', 'Корівки', 'Вулик'];
 
 async function promptSheetSelection() {
 	const response = await prompts({
@@ -54,6 +36,7 @@ async function promptSheetSelection() {
 		name: 'sheet',
 		message: 'Оберіть аркуш для моніторингу:',
 		choices: [
+			{ title: 'Усі аркуші', value: 'ALL' },
 			{ title: 'Кити', value: 'Кити' },
 			{ title: 'Омнік', value: 'Омнік' },
 			{ title: 'Лелеки', value: 'Лелеки' },
@@ -66,7 +49,12 @@ async function promptSheetSelection() {
 	});
 
 	if (!response.sheet) process.exit(0);
-	targetSheets = [response.sheet];
+
+	if (response.sheet === 'ALL') {
+		targetSheets = ALL_SHEETS;
+	} else {
+		targetSheets = [response.sheet];
+	}
 }
 
 async function main() {
@@ -77,20 +65,19 @@ async function main() {
 
 	await updateCacheShared(mainDoc, targetSheets);
 
-	const inProgressAllInit = state.activeTransactions.filter(tx => tx.status === 'in progress').length;
-	const inProgressMonitoredInit = state.activeTransactions.filter(tx =>
-		tx.status === 'in progress' && monitoredPsSet.has((tx.psName || '').toString().trim().toLowerCase())
-	).length;
-
-	console.log(`\nЗапуск моніторингу для аркуша: ${targetSheets[0]}`);
-	console.log(`Запитів in progress (незалежно від ПС): ${inProgressAllInit}`);
-	console.log(`Запитів in progress (від ПС які моніторимо): ${inProgressMonitoredInit}`);
+	const sheetsLogName = targetSheets.length > 1 ? 'Усі аркуші' : targetSheets[0];
+	console.log(`\nЗапуск моніторингу для: ${sheetsLogName}`);
 	console.log(`Початок запуску процесів...\n`);
 
 	const slackApp = createSlackApp();
 
+	let tgClients = [];
+	let tgUserIds = [];
+
 	try {
 		const { clients, ourUserIds } = await initTelegramClients();
+		tgClients = clients;
+		tgUserIds = ourUserIds;
 		await setupTelegram(mainDoc, clients, ourUserIds);
 	} catch (error) {
 		console.error('Помилка ініціалізації Telegram:', error);
@@ -106,19 +93,15 @@ async function main() {
 		}
 	}
 
-	printReport();
-
 	setInterval(async () => {
 		cacheCountdown--;
 		psCountdown--;
-
-		let shouldPrintReport = false;
+		backfillCountdown--;
 
 		if (cacheCountdown <= 0) {
 			cacheCountdown = 300;
 			try {
 				await updateCacheShared(mainDoc, targetSheets);
-				shouldPrintReport = true;
 			} catch (error) {
 				console.error('Помилка оновлення кешу:', error.message);
 			}
@@ -129,23 +112,34 @@ async function main() {
 			if (state.activeTransactions.length > 0) {
 				try {
 					await checkExternalPsUpdates(mainDoc, externalDoc, state.activeTransactions);
-					shouldPrintReport = true;
 				} catch (error) {
 					console.error('Помилка перевірки umama:', error);
 				}
 			}
 		}
 
-		if (shouldPrintReport) {
-			printReport();
+		if (backfillCountdown <= 0) {
+			backfillCountdown = 600;
+			if (state.activeTransactions.length > 0) {
+				try {
+					await runSlackBackfill(mainDoc, slackApp.client);
+					if (tgClients.length > 0) {
+						await runTelegramBackfill(mainDoc, tgClients, tgUserIds);
+					}
+				} catch (error) {
+					console.error('Помилка періодичного бекфілу:', error);
+				}
+			}
 		}
 
 		const cM = Math.floor(cacheCountdown / 60).toString().padStart(2, '0');
 		const cS = (cacheCountdown % 60).toString().padStart(2, '0');
 		const pM = Math.floor(psCountdown / 60).toString().padStart(2, '0');
 		const pS = (psCountdown % 60).toString().padStart(2, '0');
+		const bM = Math.floor(backfillCountdown / 60).toString().padStart(2, '0');
+		const bS = (backfillCountdown % 60).toString().padStart(2, '0');
 
-		process.stdout.write(`\x1b[2K\rОновлення кешу через: ${cM}:${cS} | Перевірка umama через: ${pM}:${pS}`);
+		process.stdout.write(`\x1b[2K\rОновлення кешу: ${cM}:${cS} | umama: ${pM}:${pS} | Авто-бекфіл: ${bM}:${bS}`);
 	}, 1000);
 
 	await slackApp.start();

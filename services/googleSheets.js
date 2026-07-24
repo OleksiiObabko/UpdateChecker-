@@ -34,7 +34,6 @@ async function initExternalSheets() {
 
 async function fetchActiveTransactions(doc, targetSheets) {
 	const activeTransactions = [];
-	const seenTransactionIds = new Set();
 	const slackPsList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
 
 	for (const sheetName of targetSheets) {
@@ -46,6 +45,7 @@ async function fetchActiveTransactions(doc, targetSheets) {
 			const expectFromRaw = row.get('Від кого очікуємо відповідь');
 			const statusRaw = row.get('Статус');
 			const bankTransactionIdRaw = row.get('status.bankTransactionId');
+			const cpayRaw = row.get('Cpay'); // Зчитуємо колонку Cpay
 			const psNameRaw = row.get('ПС');
 			const ourIdRaw = row.get(sheet.headerValues[3]);
 			const currencyRaw = row.get('Валюта') || row.get(sheet.headerValues[2]);
@@ -55,29 +55,30 @@ async function fetchActiveTransactions(doc, targetSheets) {
 			const psName = psNameRaw ? psNameRaw.toString().trim().toLowerCase() : '';
 			const currency = currencyRaw ? currencyRaw.toString().trim().toUpperCase() : null;
 
+			const bankTxId = bankTransactionIdRaw ? bankTransactionIdRaw.toString().trim() : '';
+			const cpayId = cpayRaw ? cpayRaw.toString().trim() : '';
+			const ourId = ourIdRaw ? ourIdRaw.toString().trim() : '';
+
 			const isStatusValid = status === '' || status === 'in progress' || status === 'update';
 			const isExpectFromValid = expectFrom === '' || expectFrom === 'пс';
 
 			if (isExpectFromValid && isStatusValid) {
 				const isSlackPs = slackPsList.includes(psName);
-				let trackingId = null;
+				let trackingId = '';
 
-				if (isSlackPs && ourIdRaw && ourIdRaw.toString().trim() !== '') {
-					trackingId = ourIdRaw.toString().trim();
-				} else if (bankTransactionIdRaw && bankTransactionIdRaw.toString().trim() !== '') {
-					trackingId = bankTransactionIdRaw.toString().trim();
+				if (isSlackPs && ourId !== '') {
+					trackingId = ourId;
+				} else if (bankTxId !== '') {
+					trackingId = bankTxId;
+				} else if (cpayId !== '') {
+					// Якщо немає Bank ID, використовуємо Cpay як основний ID
+					trackingId = cpayId;
 				}
 
-				if (trackingId) {
-					// Захист від дубльованих рядків з однаковим ID у таблиці
-					if (seenTransactionIds.has(trackingId)) {
-						console.error(`Дублікат ID у "${sheetName.trim()}", рядок ${row.rowNumber}: "${trackingId}" вже додано раніше — пропущено`);
-						continue;
-					}
-					seenTransactionIds.add(trackingId);
-
+				if (trackingId !== '') {
 					activeTransactions.push({
 						transactionId: trackingId,
+						cpay: cpayId, // Передаємо Cpay далі для лайв-пошуку
 						psName: psNameRaw,
 						sheetName: sheetName.trim(),
 						status: status || 'in progress',
@@ -100,11 +101,16 @@ async function updateTransactionStatus(doc, sheetName, transactionId, newStatus)
 
 	const rows = await sheet.getRows();
 
-	const row = rows.find(r => {
+	const row = rows.findLast(r => {
 		const bankId = r.get('status.bankTransactionId');
 		const ourId = r.get(sheet.headerValues[3]);
-		return (bankId && bankId.toString().trim() === transactionId.toString().trim()) ||
-			(ourId && ourId.toString().trim() === transactionId.toString().trim());
+		const cpay = r.get('Cpay'); // Додаємо пошук по Cpay
+
+		const targetId = transactionId.toString().trim();
+
+		return (bankId && bankId.toString().trim() === targetId) ||
+			(ourId && ourId.toString().trim() === targetId) ||
+			(cpay && cpay.toString().trim() === targetId);
 	});
 
 	if (!row) {
@@ -139,7 +145,6 @@ async function findTransactionInExternalSheets(externalDoc, tx, sheetCache) {
 
 		if (matches.length === 0) continue;
 
-		// Останній рядок у таблиці = останнє (найновіше) звернення
 		const row = matches[matches.length - 1];
 		return { row, sheetName };
 	}
@@ -186,11 +191,16 @@ async function checkExternalPsUpdates(doc, externalDoc, transactions) {
 			}
 			const mainRows = mainSheetRowsCache.get(tx.sheetName);
 
-			const row = mainRows.find(r => {
+			const row = mainRows.findLast(r => {
 				const bankId = r.get('status.bankTransactionId');
 				const ourId = r.get(mainSheet.headerValues[3]);
-				return (bankId && bankId.toString().trim() === tx.transactionId.toString().trim()) ||
-					(ourId && ourId.toString().trim() === tx.transactionId.toString().trim());
+				const cpay = r.get('Cpay');
+
+				const targetId = tx.transactionId.toString().trim();
+
+				return (bankId && bankId.toString().trim() === targetId) ||
+					(ourId && ourId.toString().trim() === targetId) ||
+					(cpay && cpay.toString().trim() === targetId);
 			});
 
 			if (!row) continue;

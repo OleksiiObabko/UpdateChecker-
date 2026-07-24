@@ -4,28 +4,28 @@ const { logStatusChange } = require('./statusLog');
 
 const BACKFILL_DAYS = Number(process.env.TELEGRAM_BACKFILL_DAYS || 60);
 
-// Формат рядка в KNOWN_CHAT_IDS: -123123123 (Назва ПС)
 const psChatMap = new Map();
 const knownChatIds = [];
 
-(process.env.KNOWN_CHAT_IDS || '')
-	.split('\n')
-	.map(line => line.trim())
-	.filter(line => line.length > 0)
-	.forEach(line => {
-		const idMatch = line.match(/-?\d+/);
-		const nameMatch = line.match(/\(([^)]+)\)/);
+const matches = [...(process.env.KNOWN_CHAT_IDS || '').matchAll(/(-?\d+)\s*\(([^)]+)\)/g)];
 
-		if (!idMatch) return;
-		const chatId = Number(idMatch[0]);
+for (const match of matches) {
+	const chatId = Number(match[1]);
+	const psNames = match[2].split(',').map(s => s.trim().toLowerCase());
+
+	if (!knownChatIds.includes(chatId)) {
 		knownChatIds.push(chatId);
+	}
 
-		if (nameMatch) {
-			const psName = nameMatch[1].trim().toLowerCase();
-			if (!psChatMap.has(psName)) psChatMap.set(psName, []);
+	for (const psName of psNames) {
+		if (!psChatMap.has(psName)) {
+			psChatMap.set(psName, []);
+		}
+		if (!psChatMap.get(psName).includes(chatId)) {
 			psChatMap.get(psName).push(chatId);
 		}
-	});
+	}
+}
 
 function getPsNameForChat(chatId) {
 	for (const [psName, chatIds] of psChatMap.entries()) {
@@ -51,7 +51,9 @@ async function resolveTransactionFromReply(client, chatId, replyToMsgId, candida
 			if (msg && msg.message) {
 				const allKnownTxs = [...candidateTxs, ...Array.from(globalMessageCache.values())];
 				for (const tx of allKnownTxs) {
-					if (msg.message.includes(tx.transactionId)) {
+					const txId = tx.transactionId;
+					const cpay = tx.cpay;
+					if ((txId && msg.message.includes(txId)) || (cpay && msg.message.includes(cpay))) {
 						globalMessageCache.set(replyToMsgId, tx);
 						return tx;
 					}
@@ -67,8 +69,6 @@ async function resolveTransactionFromReply(client, chatId, replyToMsgId, candida
 	return null;
 }
 
-// Обробка ОДНОГО live-повідомлення — статус пишеться відразу, бо нові повідомлення приходять
-// по одному й у хронологічному порядку, тож "останнє" завжди й так є найсвіжіший стан.
 async function processTelegramMessage(doc, client, chatId, message, ourUserIds, candidateTxs) {
 	if (!message) return;
 
@@ -90,14 +90,18 @@ async function processTelegramMessage(doc, client, chatId, message, ourUserIds, 
 
 	if (message.message) {
 		for (const [, tx] of globalMessageCache.entries()) {
-			if (message.message.includes(tx.transactionId)) {
+			const txId = tx.transactionId;
+			const cpay = tx.cpay;
+			if ((txId && message.message.includes(txId)) || (cpay && message.message.includes(cpay))) {
 				matchedTx = tx;
 				break;
 			}
 		}
 		if (!matchedTx) {
 			for (const tx of candidateTxs) {
-				if (message.message.includes(tx.transactionId)) {
+				const txId = tx.transactionId;
+				const cpay = tx.cpay;
+				if ((txId && message.message.includes(txId)) || (cpay && message.message.includes(cpay))) {
 					matchedTx = tx;
 					break;
 				}
@@ -148,21 +152,27 @@ function makeTelegramMessageHandler(doc, client, ourUserIds) {
 	};
 }
 
-async function findTransactionMessagesInChat(client, chatId, transactionId, cutoffTimestamp) {
-	try {
-		const results = await client.getMessages(chatId, {
-			search: transactionId,
-			limit: 20
-		});
-		return results.filter(msg => msg.date && msg.date >= cutoffTimestamp);
-	} catch (error) {
-		console.error(`Помилка пошуку "${transactionId}" в чаті ${chatId}:`, error.message);
-		return [];
+async function findTransactionMessagesInChat(clients, chatId, searchTerm, cutoffTimestamp) {
+	let lastError = null;
+
+	for (const client of clients) {
+		try {
+			const results = await client.getMessages(chatId, {
+				search: searchTerm,
+				limit: 20
+			});
+			return results.filter(msg => msg.date && msg.date >= cutoffTimestamp);
+		} catch (error) {
+			lastError = error;
+		}
 	}
+
+	if (lastError) {
+		console.error(`Помилка пошуку "${searchTerm}" в чаті ${chatId} (перевірено всі акаунти):`, lastError.message);
+	}
+	return [];
 }
 
-// Дивимось ЛИШЕ на останнє (найновіше) повідомлення в зібраній переписці по транзакції —
-// пишемо в таблицю щонайбільше один раз, замість реакції на кожне повідомлення по черзі.
 async function applyFinalStatusFromMessages(doc, tx, messages, ourUserIds) {
 	if (messages.length === 0) return false;
 
@@ -194,9 +204,11 @@ async function applyFinalStatusFromMessages(doc, tx, messages, ourUserIds) {
 	}
 }
 
-async function runTelegramBackfill(doc, clients, ourUserIds) {
+async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = false) {
 	const cutoffTimestamp = Math.floor(Date.now() / 1000) - BACKFILL_DAYS * 24 * 60 * 60;
-	const client = clients[0];
+
+	const slackPsList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
+	const externalPsNames = process.env.EXTERNAL_PS_NAMES ? process.env.EXTERNAL_PS_NAMES.split(',').map(s => s.trim().toLowerCase()) : [];
 
 	const initialActiveCount = state.activeTransactions.filter(tx => {
 		const status = (tx.status || '').toString().trim().toLowerCase();
@@ -206,6 +218,7 @@ async function runTelegramBackfill(doc, clients, ourUserIds) {
 	let totalMatched = 0;
 	let updatedCount = 0;
 	let skippedNoChat = 0;
+	const unmonitoredPsNames = new Set();
 
 	console.log(`Бекфіл Telegram: перевіряю ${state.activeTransactions.length} транзакцій по відповідних чатах ПС (за ${BACKFILL_DAYS} дн.)...`);
 
@@ -215,12 +228,21 @@ async function runTelegramBackfill(doc, clients, ourUserIds) {
 
 		if (!chatIds || chatIds.length === 0) {
 			skippedNoChat++;
+			if (psName && !slackPsList.includes(psName) && !externalPsNames.includes(psName)) {
+				unmonitoredPsNames.add(psName);
+			}
+			continue;
+		}
+
+		const searchTerm = tx.transactionId || tx.cpay;
+		if (!searchTerm) {
+			skippedNoChat++;
 			continue;
 		}
 
 		const allMessages = [];
 		for (const chatId of chatIds) {
-			const messages = await findTransactionMessagesInChat(client, chatId, tx.transactionId, cutoffTimestamp);
+			const messages = await findTransactionMessagesInChat(clients, chatId, searchTerm, cutoffTimestamp);
 			allMessages.push(...messages);
 		}
 
@@ -241,13 +263,17 @@ async function runTelegramBackfill(doc, clients, ourUserIds) {
 	console.log(`  Активних запитів на початку: ${initialActiveCount}`);
 	console.log(`  Надано апдейтів статусу: ${updatedCount}`);
 	console.log(`  Активних запитів лишилось: ${remainingActiveCount}`);
-	console.log(`  Опрацьовано повідомлень: ${totalMatched}. Транзакцій без відповідного чату ПС: ${skippedNoChat}`);
+	console.log(`  Опрацьовано повідомлень: ${totalMatched}. Транзакцій без чату: ${skippedNoChat}`);
+
+	if (isInitialRun && unmonitoredPsNames.size > 0) {
+		console.log(`  [УВАГА] Не стежимо за цими ПС (немає налаштувань ні для TG, ні для Slack/umama): ${Array.from(unmonitoredPsNames).join(', ')}`);
+	}
 }
 
 async function setupTelegram(mainDoc, telegramClients, ourUserIds) {
 	const { NewMessage } = require('telegram/events');
 
-	await runTelegramBackfill(mainDoc, telegramClients, ourUserIds);
+	await runTelegramBackfill(mainDoc, telegramClients, ourUserIds, true);
 
 	for (const client of telegramClients) {
 		client.addEventHandler(makeTelegramMessageHandler(mainDoc, client, ourUserIds), new NewMessage({}));
@@ -255,4 +281,4 @@ async function setupTelegram(mainDoc, telegramClients, ourUserIds) {
 	console.log(`Telegram: підключено ${telegramClients.length} клієнт(и), слухаємо чатів: ${knownChatIds.length}`);
 }
 
-module.exports = { setupTelegram };
+module.exports = { setupTelegram, runTelegramBackfill };

@@ -9,11 +9,11 @@ const {
 } = require('./services/googleSheets');
 const { initTelegramClients } = require('./services/telegram');
 const { setupTelegram } = require('./services/telegramHandler');
-const { createSlackApp } = require('./services/slack');
+const { createSlackApp, runSlackBackfill } = require('./services/slack');
 
 let targetSheets = [];
 let cacheCountdown = 300;
-let psCountdown = 300;
+let psCountdown = 10;
 
 const originalLog = console.log;
 console.log = function (...args) {
@@ -26,6 +26,27 @@ console.error = function (...args) {
 	process.stdout.write('\x1b[2K\r');
 	originalError.apply(console, args);
 };
+
+const umamaPs = process.env.EXTERNAL_PS_NAMES ? process.env.EXTERNAL_PS_NAMES.split(',').map(s => s.trim().toLowerCase()) : [];
+const slackPs = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
+const tgPs = (process.env.KNOWN_CHAT_IDS || '').split('\n').map(line => {
+	const match = line.match(/\(([^)]+)\)/);
+	return match ? match[1].trim().toLowerCase() : null;
+}).filter(Boolean);
+const monitoredPsSet = new Set([...umamaPs, ...slackPs, ...tgPs]);
+
+function printReport() {
+	const inProgressAll = state.activeTransactions.filter(tx => tx.status === 'in progress').length;
+	const inProgressMonitored = state.activeTransactions.filter(tx =>
+		tx.status === 'in progress' && monitoredPsSet.has((tx.psName || '').toString().trim().toLowerCase())
+	).length;
+
+	console.log(`\n--- ЗВІТ ---`);
+	console.log(`Надано апдейтів (разом): ${state.stats.updatesProvided}`);
+	console.log(`Запитів in progress (незалежно від ПС): ${inProgressAll}`);
+	console.log(`Запитів in progress (від ПС які моніторимо): ${inProgressMonitored}`);
+	console.log(`------------\n`);
+}
 
 async function promptSheetSelection() {
 	const response = await prompts({
@@ -44,10 +65,7 @@ async function promptSheetSelection() {
 		initial: 0
 	});
 
-	if (!response.sheet) {
-		process.exit(0);
-	}
-
+	if (!response.sheet) process.exit(0);
 	targetSheets = [response.sheet];
 }
 
@@ -59,8 +77,17 @@ async function main() {
 
 	await updateCacheShared(mainDoc, targetSheets);
 
+	const inProgressAllInit = state.activeTransactions.filter(tx => tx.status === 'in progress').length;
+	const inProgressMonitoredInit = state.activeTransactions.filter(tx =>
+		tx.status === 'in progress' && monitoredPsSet.has((tx.psName || '').toString().trim().toLowerCase())
+	).length;
+
 	console.log(`\nЗапуск моніторингу для аркуша: ${targetSheets[0]}`);
-	console.log(`Активних запитів знайдено: ${state.activeTransactions.length}\n`);
+	console.log(`Запитів in progress (незалежно від ПС): ${inProgressAllInit}`);
+	console.log(`Запитів in progress (від ПС які моніторимо): ${inProgressMonitoredInit}`);
+	console.log(`Початок запуску процесів...\n`);
+
+	const slackApp = createSlackApp();
 
 	try {
 		const { clients, ourUserIds } = await initTelegramClients();
@@ -70,25 +97,28 @@ async function main() {
 	}
 
 	if (state.activeTransactions.length > 0) {
-		console.log(`[Ініціалізація] Виконую першу перевірку зовнішньої таблиці ПС...`);
+		await runSlackBackfill(mainDoc, slackApp.client);
+
 		try {
 			await checkExternalPsUpdates(mainDoc, externalDoc, state.activeTransactions);
 		} catch (error) {
-			console.error('Помилка першої перевірки ПС:', error);
+			console.error('Помилка першої перевірки umama:', error);
 		}
 	}
 
-	// 3. Запуск таймерів
+	printReport();
+
 	setInterval(async () => {
 		cacheCountdown--;
 		psCountdown--;
+
+		let shouldPrintReport = false;
 
 		if (cacheCountdown <= 0) {
 			cacheCountdown = 300;
 			try {
 				await updateCacheShared(mainDoc, targetSheets);
-				const now = new Date().toLocaleTimeString('uk-UA');
-				console.log(`[${now}] Кеш оновлено. Активних запитів: ${state.activeTransactions.length}`);
+				shouldPrintReport = true;
 			} catch (error) {
 				console.error('Помилка оновлення кешу:', error.message);
 			}
@@ -99,10 +129,15 @@ async function main() {
 			if (state.activeTransactions.length > 0) {
 				try {
 					await checkExternalPsUpdates(mainDoc, externalDoc, state.activeTransactions);
+					shouldPrintReport = true;
 				} catch (error) {
-					console.error('Помилка перевірки ПС:', error);
+					console.error('Помилка перевірки umama:', error);
 				}
 			}
+		}
+
+		if (shouldPrintReport) {
+			printReport();
 		}
 
 		const cM = Math.floor(cacheCountdown / 60).toString().padStart(2, '0');
@@ -110,10 +145,9 @@ async function main() {
 		const pM = Math.floor(psCountdown / 60).toString().padStart(2, '0');
 		const pS = (psCountdown % 60).toString().padStart(2, '0');
 
-		process.stdout.write(`\x1b[2K\rОновлення кешу через: ${cM}:${cS} | Перевірка ПС через: ${pM}:${pS}`);
+		process.stdout.write(`\x1b[2K\rОновлення кешу через: ${cM}:${cS} | Перевірка umama через: ${pM}:${pS}`);
 	}, 1000);
 
-	const slackApp = createSlackApp();
 	await slackApp.start();
 }
 

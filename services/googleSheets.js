@@ -2,15 +2,12 @@ const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 const credentials = require('../credentials.json');
 const { logStatusChange } = require('./statusLog');
+const state = require('./state');
 
 const SHEET_ID = process.env.SHEET_ID;
 
 const CURRENCY_SHEET_MAP = {
-	'INR': ['all INR', 'ASAP INR', 'Bulk INR', 'INR induvidual'],
-	'NPR': ['NPR'],
-	'MAD': ['MAD'],
-	'LKR': ['LKR'],
-	'PKR': ['PKR']
+	'INR': ['all INR', 'ASAP INR']
 };
 
 const NON_FINAL_STATUSES = ['', 'в работе'];
@@ -156,27 +153,33 @@ async function checkExternalPsUpdates(doc, externalDoc, transactions) {
 			: [];
 
 		const activeTransactions = transactions.filter(tx =>
-			externalPsNames.includes(tx.psName.toLowerCase()) && tx.status.toLowerCase() === 'in progress'
+			externalPsNames.includes((tx.psName || '').toLowerCase()) && tx.status.toLowerCase() === 'in progress'
 		);
 
 		if (activeTransactions.length === 0) return;
 
 		const sheetCache = new Map();
 		const mainSheetRowsCache = new Map();
-		let updatedCount = 0;
 
 		for (const tx of activeTransactions) {
 			const found = await findTransactionInExternalSheets(externalDoc, tx, sheetCache);
 			if (!found) continue;
 
-			const rowStatus = found.row.get('Status') ? found.row.get('Status').toString().trim().toLowerCase() : '';
+			const originalStatusText = found.row.get('Status') ? found.row.get('Status').toString().trim() : '';
+			const rowStatus = originalStatusText.toLowerCase();
+
 			if (NON_FINAL_STATUSES.includes(rowStatus)) continue;
 
-			const mainSheet = doc.sheetsByTitle[tx.sheetName];
-			if (!mainSheet) {
-				console.error(`Аркуш "${tx.sheetName}" не знайдено в основній таблиці`);
-				continue;
+			let textToAdd = originalStatusText;
+			if (rowStatus !== 'в работе') {
+				const commentText = found.row.get('Comment') ? found.row.get('Comment').toString().trim() : '';
+				if (commentText) {
+					textToAdd = `${originalStatusText} | ${commentText}`;
+				}
 			}
+
+			const mainSheet = doc.sheetsByTitle[tx.sheetName];
+			if (!mainSheet) continue;
 
 			if (!mainSheetRowsCache.has(tx.sheetName)) {
 				mainSheetRowsCache.set(tx.sheetName, await mainSheet.getRows());
@@ -190,24 +193,26 @@ async function checkExternalPsUpdates(doc, externalDoc, transactions) {
 					(ourId && ourId.toString().trim() === tx.transactionId.toString().trim());
 			});
 
-			if (!row) {
-				console.error(`Рядок для ID ${tx.transactionId} не знайдено в "${tx.sheetName}" (видалений/змінений?)`);
-				continue;
-			}
+			if (!row) continue;
 
 			const previousStatus = tx.status;
 			row.set('Статус', 'update');
+
+			const currentComment = row.get('Дод.коментарі/задача') ? row.get('Дод.коментарі/задача').toString().trim() : '';
+			const newComment = currentComment
+				? `${currentComment}\n${textToAdd}`
+				: textToAdd;
+
+			row.set('Дод.коментарі/задача', newComment);
+
 			await row.save();
 			tx.status = 'update';
-			updatedCount++;
-			logStatusChange('зовнішня таблиця', tx, previousStatus, 'update');
-		}
 
-		if (updatedCount > 0) {
-			console.log(`Перевірка ПС: оновлено статусів — ${updatedCount} з ${activeTransactions.length}`);
+			state.stats.updatesProvided++;
+			logStatusChange('umama', tx, previousStatus, 'update');
 		}
 	} catch (error) {
-		console.error('Помилка перевірки ПС:', error.message);
+		console.error('Помилка перевірки umama:', error.message);
 	}
 }
 

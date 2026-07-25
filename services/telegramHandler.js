@@ -265,7 +265,7 @@ async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = fals
 	console.log(`  Активних запитів лишилось: ${remainingActiveCount}`);
 	console.log(`  Опрацьовано повідомлень: ${totalMatched}. Транзакцій без чату: ${skippedNoChat}`);
 
-	if (isInitialRun && unmonitoredPsNames.size > 0) {
+	if (unmonitoredPsNames.size > 0) {
 		console.log(`  [УВАГА] Не стежимо за цими ПС (немає налаштувань ні для TG, ні для Slack/umama): ${Array.from(unmonitoredPsNames).join(', ')}`);
 	}
 }

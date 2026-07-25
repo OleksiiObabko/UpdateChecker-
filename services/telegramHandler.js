@@ -152,23 +152,70 @@ function makeTelegramMessageHandler(doc, client, ourUserIds) {
 	};
 }
 
+const chatRecentCache = new Map();
+
 async function findTransactionMessagesInChat(clients, chatId, searchTerm, cutoffTimestamp) {
 	let lastError = null;
 
 	for (const client of clients) {
 		try {
-			const results = await client.getMessages(chatId, {
-				search: searchTerm,
-				limit: 20
-			});
-			return results.filter(msg => msg.date && msg.date >= cutoffTimestamp);
+			const now = Date.now();
+			let recentMessages = [];
+			const cacheKey = `${chatId}`;
+
+			if (chatRecentCache.has(cacheKey) && (now - chatRecentCache.get(cacheKey).ts < 60000)) {
+				recentMessages = chatRecentCache.get(cacheKey).msgs;
+			} else {
+				recentMessages = await client.getMessages(chatId, { limit: 1000 });
+				chatRecentCache.set(cacheKey, { msgs: recentMessages, ts: now });
+			}
+
+			let validBase = recentMessages.filter(msg =>
+				msg.message && msg.message.includes(searchTerm) && msg.date && msg.date >= cutoffTimestamp
+			);
+
+			if (validBase.length === 0) {
+				const searchResults = await client.getMessages(chatId, {
+					search: searchTerm,
+					limit: 20
+				});
+				validBase = searchResults.filter(msg => msg.date && msg.date >= cutoffTimestamp);
+			}
+
+			if (validBase.length === 0) {
+				continue;
+			}
+
+			const relatedMessages = new Map();
+			const chainIds = new Set();
+
+			for (const msg of validBase) {
+				relatedMessages.set(msg.id, msg);
+				chainIds.add(msg.id);
+			}
+
+			let addedNew = true;
+			while (addedNew) {
+				addedNew = false;
+				for (let i = recentMessages.length - 1; i >= 0; i--) {
+					const subMsg = recentMessages[i];
+					if (!relatedMessages.has(subMsg.id) && subMsg.replyTo && chainIds.has(subMsg.replyTo.replyToMsgId)) {
+						relatedMessages.set(subMsg.id, subMsg);
+						chainIds.add(subMsg.id);
+						addedNew = true;
+					}
+				}
+			}
+
+			return Array.from(relatedMessages.values());
+
 		} catch (error) {
 			lastError = error;
 		}
 	}
 
 	if (lastError) {
-		console.error(`Помилка пошуку "${searchTerm}" в чаті ${chatId} (перевірено всі акаунти):`, lastError.message);
+		console.error(`Помилка пошуку "${searchTerm}" в чаті ${chatId}:`, lastError.message);
 	}
 	return [];
 }
@@ -266,7 +313,7 @@ async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = fals
 	console.log(`  Опрацьовано повідомлень: ${totalMatched}. Транзакцій без чату: ${skippedNoChat}`);
 
 	if (unmonitoredPsNames.size > 0) {
-		console.log(`  [УВАГА] Не стежимо за цими ПС (немає налаштувань ні для TG, ні для Slack/umama): ${Array.from(unmonitoredPsNames).join(', ')}`);
+		console.log(`  [УВАГА] Не стежимо за цими ПС: ${Array.from(unmonitoredPsNames).join(', ')}`);
 	}
 }
 

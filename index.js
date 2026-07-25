@@ -43,7 +43,8 @@ async function promptSheetSelection() {
 			{ title: 'Фікси', value: 'Фікси' },
 			{ title: 'Дракони', value: 'Дракони' },
 			{ title: 'Корівки', value: 'Корівки' },
-			{ title: 'Вулик', value: 'Вулик' }
+			{ title: 'Вулик', value: 'Вулик' },
+			{ title: 'Запити від TripleC', value: 'Запити від TripleC' }
 		],
 		initial: 0
 	});

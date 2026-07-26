@@ -81,7 +81,8 @@ async function fetchActiveTransactions(doc, targetSheets) {
 						cpay: cpayId, // Передаємо Cpay далі для лайв-пошуку
 						psName: psNameRaw,
 						sheetName: sheetName.trim(),
-						status: status || 'in progress',
+						status: status, // лишаємо реальний статус з таблиці (може бути '') —
+					                  // саме порожній стан дозволяє першому повідомленню записати "in progress"
 						currency
 					});
 				}

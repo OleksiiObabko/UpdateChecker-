@@ -57,7 +57,7 @@ async function runSlackBackfill(doc, client) {
 	const targetTxs = state.activeTransactions.filter(tx => {
 		const ps = (tx.psName || '').toString().trim().toLowerCase();
 		const st = (tx.status || '').toString().trim().toLowerCase();
-		return slackPsList.includes(ps) && (st === '' || st === 'in progress');
+		return slackPsList.includes(ps) && (st === '' || st === 'in progress' || st === 'update');
 	});
 
 	if (targetTxs.length === 0) return;
@@ -68,35 +68,47 @@ async function runSlackBackfill(doc, client) {
 		try {
 			const searchRes = await client.search.messages({
 				query: tx.transactionId,
-				count: 1,
+				count: 20,
 				sort: 'timestamp',
 				sort_dir: 'desc',
 				token: process.env.SLACK_USER_TOKEN || process.env.SLACK_BOT_TOKEN
 			});
 
-			if (!searchRes.messages || !searchRes.messages.matches || searchRes.messages.matches.length === 0) continue;
+			const searchMatches = searchRes.messages && searchRes.messages.matches ? searchRes.messages.matches : [];
+			if (searchMatches.length === 0) continue;
 
-			const msg = searchRes.messages.matches[0];
-			if (!msg.channel || !msg.channel.id || !msg.ts) continue;
+			// Кожен збіг міг бути реплаєм — справжній корінь треду це msg.thread_ts (якщо є), інакше сам msg.ts.
+			// Дедуплікуємо, щоб не смикати той самий тред двічі.
+			const rootCandidates = new Map(); // "channelId|rootTs" -> {channelId, rootTs}
+			for (const msg of searchMatches) {
+				if (!msg.channel || !msg.channel.id) continue;
+				const rootTs = msg.thread_ts || msg.ts;
+				rootCandidates.set(`${msg.channel.id}|${rootTs}`, { channelId: msg.channel.id, rootTs });
+			}
 
-			const threadRes = await client.conversations.replies({
-				channel: msg.channel.id,
-				ts: msg.ts
-			});
+			for (const { channelId, rootTs } of rootCandidates.values()) {
+				const threadRes = await client.conversations.replies({ channel: channelId, ts: rootTs });
 
-			if (!threadRes.messages || threadRes.messages.length <= 1) continue;
+				if (!threadRes.messages || threadRes.messages.length <= 1) continue;
 
-			const lastReply = threadRes.messages[threadRes.messages.length - 1];
-			const isFromUs = lastReply.user === process.env.OUR_SLACK_USER_ID;
+				// Перевіряємо, що це справді "наш" тред по цій транзакції — ID має бути в кореневому повідомленні
+				const parentText = threadRes.messages[0].text || '';
+				if (!parentText.includes(tx.transactionId)) continue;
 
-			if (!isFromUs) {
-				const previousStatus = tx.status;
-				const ok = await updateTransactionStatus(doc, tx.sheetName, tx.transactionId, 'update');
+				const lastReply = threadRes.messages[threadRes.messages.length - 1];
+				const isFromUs = lastReply.user === process.env.OUR_SLACK_USER_ID;
+				const newStatus = isFromUs ? 'in progress' : 'update';
+
+				const currentStatus = (tx.status || '').toString().trim().toLowerCase();
+				if (currentStatus === newStatus) break;
+
+				const ok = await updateTransactionStatus(doc, tx.sheetName, tx.transactionId, newStatus);
 				if (ok) {
-					logStatusChange('Slack, бекфіл', tx, previousStatus, 'update');
-					tx.status = 'update';
+					logStatusChange('Slack, бекфіл', tx, currentStatus, newStatus);
+					tx.status = newStatus;
 					if (state.stats) state.stats.updatesProvided++;
 				}
+				break; // знайшли й обробили правильний тред — далі не треба
 			}
 		} catch (err) {
 			console.error(`Помилка бекфілу Slack для ${tx.transactionId}:`, err.message);

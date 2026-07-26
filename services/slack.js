@@ -13,9 +13,6 @@ function createSlackApp() {
 	slackApp.message(async ({ message, client }) => {
 		if (message.subtype || !message.thread_ts || message.ts === message.thread_ts) return;
 
-		const isFromUs = message.user === process.env.OUR_SLACK_USER_ID;
-		if (isFromUs) return;
-
 		try {
 			const threadData = await client.conversations.replies({
 				channel: message.channel,
@@ -31,16 +28,21 @@ function createSlackApp() {
 
 			const transactionId = match[1];
 			const matchedTx = state.activeTransactions.find(tx => tx.transactionId === transactionId);
+			if (!matchedTx) return;
 
-			if (matchedTx) {
-				const previousStatus = matchedTx.status;
-				const doc = await initGoogleSheets();
-				const ok = await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, 'update');
-				if (ok) {
-					logStatusChange('Slack, live', matchedTx, previousStatus, 'update');
-					matchedTx.status = 'update';
-					if (state.stats) state.stats.updatesProvided++;
-				}
+			const isFromUs = message.user === process.env.OUR_SLACK_USER_ID;
+			const newStatus = isFromUs ? 'in progress' : 'update';
+
+			const currentStatus = (matchedTx.status || '').toString().trim().toLowerCase();
+			if (currentStatus === newStatus) return;
+
+			const previousStatus = matchedTx.status;
+			const doc = await initGoogleSheets();
+			const ok = await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, newStatus);
+			if (ok) {
+				logStatusChange('Slack, live', matchedTx, previousStatus, newStatus);
+				matchedTx.status = newStatus;
+				if (state.stats) state.stats.updatesProvided++;
 			}
 		} catch (error) {
 			console.error('Помилка обробки Slack-повідомлення:', error);

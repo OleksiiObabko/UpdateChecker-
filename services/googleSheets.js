@@ -45,7 +45,7 @@ async function fetchActiveTransactions(doc, targetSheets) {
 			const expectFromRaw = row.get('Від кого очікуємо відповідь');
 			const statusRaw = row.get('Статус');
 			const bankTransactionIdRaw = row.get('status.bankTransactionId');
-			const cpayRaw = row.get('Cpay'); // Зчитуємо колонку Cpay
+			const cpayRaw = row.get('Cpay');
 			const psNameRaw = row.get('ПС');
 			const ourIdRaw = row.get(sheet.headerValues[3]);
 			const currencyRaw = row.get('Валюта') || row.get(sheet.headerValues[2]);
@@ -71,18 +71,16 @@ async function fetchActiveTransactions(doc, targetSheets) {
 				} else if (bankTxId !== '') {
 					trackingId = bankTxId;
 				} else if (cpayId !== '') {
-					// Якщо немає Bank ID, використовуємо Cpay як основний ID
 					trackingId = cpayId;
 				}
 
 				if (trackingId !== '') {
 					activeTransactions.push({
 						transactionId: trackingId,
-						cpay: cpayId, // Передаємо Cpay далі для лайв-пошуку
+						cpay: cpayId,
 						psName: psNameRaw,
 						sheetName: sheetName.trim(),
-						status: status, // лишаємо реальний статус з таблиці (може бути '') —
-					                  // саме порожній стан дозволяє першому повідомленню записати "in progress"
+						status: status,
 						currency
 					});
 				}
@@ -105,7 +103,7 @@ async function updateTransactionStatus(doc, sheetName, transactionId, newStatus)
 	const row = rows.findLast(r => {
 		const bankId = r.get('status.bankTransactionId');
 		const ourId = r.get(sheet.headerValues[3]);
-		const cpay = r.get('Cpay'); // Додаємо пошук по Cpay
+		const cpay = r.get('Cpay');
 
 		const targetId = transactionId.toString().trim();
 
@@ -122,6 +120,32 @@ async function updateTransactionStatus(doc, sheetName, transactionId, newStatus)
 	row.set('Статус', newStatus);
 	await row.save();
 	return true;
+}
+
+async function findTransactionAnySheet(doc, targetSheets, transactionId) {
+	const targetId = transactionId.toString().trim();
+
+	for (const sheetName of targetSheets) {
+		const sheet = doc.sheetsByTitle[sheetName.trim()];
+		if (!sheet) continue;
+
+		const rows = await sheet.getRows();
+
+		const row = rows.findLast(r => {
+			const bankId = r.get('status.bankTransactionId');
+			const ourId = r.get(sheet.headerValues[3]);
+			const cpay = r.get('Cpay');
+
+			return (bankId && bankId.toString().trim() === targetId) ||
+				(ourId && ourId.toString().trim() === targetId) ||
+				(cpay && cpay.toString().trim() === targetId);
+		});
+
+		if (row) {
+			return { sheetName: sheetName.trim(), row };
+		}
+	}
+	return null;
 }
 
 async function findTransactionInExternalSheets(externalDoc, tx, sheetCache) {
@@ -231,6 +255,7 @@ module.exports = {
 	initGoogleSheets,
 	fetchActiveTransactions,
 	updateTransactionStatus,
+	findTransactionAnySheet,
 	initExternalSheets,
 	checkExternalPsUpdates
 };

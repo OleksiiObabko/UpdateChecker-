@@ -62,6 +62,8 @@ async function promptSheetSelection() {
 async function main() {
 	await promptSheetSelection();
 
+	state.targetSheets = targetSheets;
+
 	const mainDoc = await initGoogleSheets();
 	const externalDoc = await initExternalSheets();
 

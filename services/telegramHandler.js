@@ -1,5 +1,5 @@
 const state = require('./state');
-const { updateTransactionStatus } = require('./googleSheets');
+const { updateTransactionStatus, findTransactionAnySheet } = require('./googleSheets');
 const { logStatusChange } = require('./statusLog');
 
 const BACKFILL_DAYS = Number(process.env.TELEGRAM_BACKFILL_DAYS || 60);
@@ -34,10 +34,16 @@ function getPsNameForChat(chatId) {
 	return null;
 }
 
+function extractPotentialIds(text) {
+	if (!text) return [];
+	const extracted = text.match(/\b(?=[a-zA-Z0-9_-]*\d)[a-zA-Z0-9_-]{3,}\b/g);
+	return extracted ? Array.from(new Set(extracted)) : [];
+}
+
 const globalMessageCache = new Map();
 const handledMessages = new Set();
 
-async function resolveTransactionFromReply(client, chatId, replyToMsgId, candidateTxs, depth = 0) {
+async function resolveTransactionFromReply(doc, client, chatId, replyToMsgId, candidateTxs, depth = 0) {
 	if (depth > 3) return null;
 
 	if (globalMessageCache.has(replyToMsgId)) {
@@ -58,13 +64,36 @@ async function resolveTransactionFromReply(client, chatId, replyToMsgId, candida
 						return tx;
 					}
 				}
+
+				if (state.targetSheets && state.targetSheets.length > 0) {
+					const potentialIds = extractPotentialIds(msg.message);
+					for (const matchId of potentialIds.slice(0, 2)) {
+						const found = await findTransactionAnySheet(doc, state.targetSheets, matchId);
+						if (found) {
+							const psNameRaw = found.row.get('ПС');
+							const cpayRaw = found.row.get('Cpay');
+							const statusRaw = found.row.get('Статус');
+
+							const matchedTx = {
+								transactionId: matchId,
+								psName: psNameRaw,
+								cpay: cpayRaw ? cpayRaw.toString().trim() : '',
+								sheetName: found.sheetName,
+								status: statusRaw ? statusRaw.toString().trim().toLowerCase() : ''
+							};
+							state.activeTransactions.push(matchedTx);
+							globalMessageCache.set(replyToMsgId, matchedTx);
+							return matchedTx;
+						}
+					}
+				}
 			}
 			if (msg && msg.replyTo) {
-				return await resolveTransactionFromReply(client, chatId, msg.replyTo.replyToMsgId, candidateTxs, depth + 1);
+				return await resolveTransactionFromReply(doc, client, chatId, msg.replyTo.replyToMsgId, candidateTxs, depth + 1);
 			}
 		}
 	} catch (err) {
-		console.error('Помилка отримання оригінального повідомлення:', err);
+		console.error(err);
 	}
 	return null;
 }
@@ -107,10 +136,32 @@ async function processTelegramMessage(doc, client, chatId, message, ourUserIds, 
 				}
 			}
 		}
+
+		if (!matchedTx && state.targetSheets && state.targetSheets.length > 0) {
+			const potentialIds = extractPotentialIds(message.message);
+			for (const matchId of potentialIds.slice(0, 2)) {
+				const found = await findTransactionAnySheet(doc, state.targetSheets, matchId);
+				if (found) {
+					const psNameRaw = found.row.get('ПС');
+					const cpayRaw = found.row.get('Cpay');
+					const statusRaw = found.row.get('Статус');
+
+					matchedTx = {
+						transactionId: matchId,
+						psName: psNameRaw,
+						cpay: cpayRaw ? cpayRaw.toString().trim() : '',
+						sheetName: found.sheetName,
+						status: statusRaw ? statusRaw.toString().trim().toLowerCase() : ''
+					};
+					state.activeTransactions.push(matchedTx);
+					break;
+				}
+			}
+		}
 	}
 
 	if (!matchedTx && message.replyTo) {
-		matchedTx = await resolveTransactionFromReply(client, chatId, message.replyTo.replyToMsgId, candidateTxs);
+		matchedTx = await resolveTransactionFromReply(doc, client, chatId, message.replyTo.replyToMsgId, candidateTxs);
 	}
 
 	if (!matchedTx) return;
@@ -121,17 +172,24 @@ async function processTelegramMessage(doc, client, chatId, message, ourUserIds, 
 	const currentStatus = (matchedTx.status || '').toString().trim().toLowerCase();
 	if (currentStatus === newStatus) return;
 
+	matchedTx.status = newStatus;
+	const txIndex = state.activeTransactions.findIndex(tx => tx.transactionId === matchedTx.transactionId);
+	if (txIndex !== -1) {
+		state.activeTransactions[txIndex].status = newStatus;
+	}
+
 	try {
 		const ok = await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, newStatus);
 		if (ok) {
 			logStatusChange('Telegram, live', matchedTx, currentStatus, newStatus);
-			matchedTx.status = newStatus;
-
-			const txIndex = state.activeTransactions.findIndex(tx => tx.transactionId === matchedTx.transactionId);
-			if (txIndex !== -1) state.activeTransactions[txIndex].status = newStatus;
+		} else {
+			matchedTx.status = currentStatus;
+			if (txIndex !== -1) state.activeTransactions[txIndex].status = currentStatus;
 		}
 	} catch (error) {
-		console.error('Помилка оновлення статусу (Telegram, live):', error);
+		matchedTx.status = currentStatus;
+		if (txIndex !== -1) state.activeTransactions[txIndex].status = currentStatus;
+		console.error(error);
 	}
 }
 
@@ -215,7 +273,7 @@ async function findTransactionMessagesInChat(clients, chatId, searchTerm, cutoff
 	}
 
 	if (lastError) {
-		console.error(`Помилка пошуку "${searchTerm}" в чаті ${chatId}:`, lastError.message);
+		console.error(lastError.message);
 	}
 	return [];
 }
@@ -246,7 +304,6 @@ async function applyFinalStatusFromMessages(doc, tx, messages, ourUserIds) {
 		globalMessageCache.set(lastMessage.id, tx);
 		return true;
 	} catch (error) {
-		console.error('Помилка оновлення статусу (Telegram, бекфіл):', error);
 		return false;
 	}
 }

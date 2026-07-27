@@ -1,50 +1,17 @@
 const { App } = require('@slack/bolt');
 const state = require('./state');
-const { initGoogleSheets, updateTransactionStatus, findTransactionAnySheet } = require('./googleSheets');
-const { logStatusChange } = require('./statusLog');
+const { resolveTransactionById } = require('./slackUtils');
+const { handleStandardSlackMessage, processStandardBackfillThread } = require('./slackStandard');
+const { handleTicketSlackMessage, processTicketBackfillThread } = require('./slackTicket');
 
-async function applyStatusFromMatch(source, matchedTx, newStatus) {
-	const currentStatus = (matchedTx.status || '').toString().trim().toLowerCase();
-	if (currentStatus === newStatus) return;
+function getPsType(psNameRaw) {
+	const psName = (psNameRaw || '').toString().trim().toLowerCase();
+	const standardList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
+	const ticketList = process.env.SLACK_TICKET_PS ? process.env.SLACK_TICKET_PS.split(',').map(s => s.trim().toLowerCase()) : [];
 
-	const previousStatus = matchedTx.status;
-	const doc = await initGoogleSheets();
-	const ok = await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, newStatus);
-	if (ok) {
-		logStatusChange(source, matchedTx, previousStatus, newStatus);
-		matchedTx.status = newStatus;
-		if (state.stats) state.stats.updatesProvided++;
-	}
-}
-
-// Шукає транзакцію в кеші; якщо не знайдено — шукає напряму в Google Таблиці
-// (покриває щойно створені рядки, які ще не потрапили в state.activeTransactions).
-async function resolveTransactionById(transactionId) {
-	let matchedTx = state.activeTransactions.find(tx => tx.transactionId === transactionId);
-	if (matchedTx) return matchedTx;
-
-	if (!state.targetSheets || state.targetSheets.length === 0) return null;
-
-	const doc = await initGoogleSheets();
-	const found = await findTransactionAnySheet(doc, state.targetSheets, transactionId);
-	if (!found) return null;
-
-	const psNameRaw = found.row.get('ПС');
-	const cpayRaw = found.row.get('Cpay');
-	const statusRaw = found.row.get('Статус');
-
-	matchedTx = {
-		transactionId,
-		psName: psNameRaw,
-		cpay: cpayRaw ? cpayRaw.toString().trim() : '',
-		sheetName: found.sheetName,
-		status: statusRaw ? statusRaw.toString().trim().toLowerCase() : ''
-	};
-
-	// Додаємо в кеш одразу — щоб наступні повідомлення (і Telegram-хендлер теж) бачили її без затримки
-	state.activeTransactions.push(matchedTx);
-
-	return matchedTx;
+	if (standardList.includes(psName)) return 'standard';
+	if (ticketList.includes(psName)) return 'ticket';
+	return null;
 }
 
 function createSlackApp() {
@@ -75,25 +42,25 @@ function createSlackApp() {
 				parentText = message.text;
 			}
 
-			const match = parentText.match(/\b(\d+)\b/);
+			const match = parentText.match(/\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}|\d+)\b/);
 			if (!match) return;
 
 			const transactionId = match[1];
 			const matchedTx = await resolveTransactionById(transactionId);
 			if (!matchedTx) return;
 
-			const senderId = message.user;
-			if (!senderId) return;
+			const psType = getPsType(matchedTx.psName);
+			if (!psType) return;
 
-			const isFromUs = senderId === process.env.OUR_SLACK_USER_ID;
+			const ourUserId = process.env.OUR_SLACK_USER_ID;
 
-			// Для кореневого повідомлення без реплая — тригеримо лише якщо це МИ подали запит
-			if (!isReply && !isFromUs) return;
-
-			const newStatus = isFromUs ? 'in progress' : 'update';
-			await applyStatusFromMatch('Slack, live', matchedTx, newStatus);
+			if (psType === 'standard') {
+				await handleStandardSlackMessage(message, matchedTx, isReply, ourUserId);
+			} else if (psType === 'ticket') {
+				await handleTicketSlackMessage(message, matchedTx, isReply, ourUserId);
+			}
 		} catch (error) {
-			console.error('Помилка обробки Slack-повідомлення:', error);
+			process.stdout.write(`\x1b[2K\rПомилка обробки Slack-повідомлення: ${error.message}\n`);
 		}
 	});
 
@@ -101,18 +68,21 @@ function createSlackApp() {
 }
 
 async function runSlackBackfill(doc, client) {
-	const slackPsList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
-	if (slackPsList.length === 0) return;
+	const standardList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
+	const ticketList = process.env.SLACK_TICKET_PS ? process.env.SLACK_TICKET_PS.split(',').map(s => s.trim().toLowerCase()) : [];
+	const allSlackPs = [...standardList, ...ticketList];
+
+	if (allSlackPs.length === 0) return;
 
 	const targetTxs = state.activeTransactions.filter(tx => {
 		const ps = (tx.psName || '').toString().trim().toLowerCase();
 		const st = (tx.status || '').toString().trim().toLowerCase();
-		return slackPsList.includes(ps) && (st === '' || st === 'in progress' || st === 'update');
+		return allSlackPs.includes(ps) && (st === '' || st === 'in progress' || st === 'update');
 	});
 
 	if (targetTxs.length === 0) return;
 
-	console.log(`Бекфіл Slack: перевіряю ${targetTxs.length} транзакцій...`);
+	process.stdout.write(`\x1b[2K\rБекфіл Slack: перевіряю ${targetTxs.length} транзакцій...\n`);
 
 	for (const tx of targetTxs) {
 		try {
@@ -125,44 +95,42 @@ async function runSlackBackfill(doc, client) {
 			});
 
 			const searchMatches = searchRes.messages && searchRes.messages.matches ? searchRes.messages.matches : [];
-			if (searchMatches.length === 0) continue;
 
-			const rootCandidates = new Map();
-			for (const msg of searchMatches) {
-				if (!msg.channel || !msg.channel.id) continue;
-				const rootTs = msg.thread_ts || msg.ts;
-				rootCandidates.set(`${msg.channel.id}|${rootTs}`, { channelId: msg.channel.id, rootTs });
-			}
+			if (searchMatches.length > 0) {
+				const rootCandidates = new Map();
+				for (const msg of searchMatches) {
+					if (!msg.channel || !msg.channel.id) continue;
+					const rootTs = msg.thread_ts || msg.ts;
+					rootCandidates.set(`${msg.channel.id}|${rootTs}`, { channelId: msg.channel.id, rootTs });
+				}
 
-			for (const { channelId, rootTs } of rootCandidates.values()) {
-				const threadRes = await client.conversations.replies({ channel: channelId, ts: rootTs });
+				for (const { channelId, rootTs } of rootCandidates.values()) {
+					const threadRes = await client.conversations.replies({ channel: channelId, ts: rootTs });
 
-				if (!threadRes.messages || threadRes.messages.length === 0) continue;
+					if (!threadRes.messages || threadRes.messages.length === 0) continue;
 
-				const parentText = threadRes.messages[0].text || '';
-				if (!parentText.includes(tx.transactionId)) continue;
+					const parentText = threadRes.messages[0].text || '';
+					if (!parentText.includes(tx.transactionId)) continue;
 
-				if (threadRes.messages.length === 1) {
-					const isFromUs = threadRes.messages[0].user === process.env.OUR_SLACK_USER_ID;
-					if (isFromUs) {
-						await applyStatusFromMatch('Slack, бекфіл (новий запит)', tx, 'in progress');
+					const psType = getPsType(tx.psName);
+					const ourUserId = process.env.OUR_SLACK_USER_ID;
+
+					if (psType === 'standard') {
+						await processStandardBackfillThread(tx, ourUserId, threadRes.messages);
+					} else if (psType === 'ticket') {
+						await processTicketBackfillThread(tx, ourUserId, threadRes.messages);
 					}
 					break;
 				}
-
-				const lastReply = threadRes.messages[threadRes.messages.length - 1];
-				const isFromUs = lastReply.user === process.env.OUR_SLACK_USER_ID;
-				const newStatus = isFromUs ? 'in progress' : 'update';
-
-				await applyStatusFromMatch('Slack, бекфіл', tx, newStatus);
-				break;
 			}
 		} catch (err) {
-			console.error(`Помилка бекфілу Slack для ${tx.transactionId}:`, err.message);
+			process.stdout.write(`\x1b[2K\rПомилка бекфілу Slack для ${tx.transactionId}: ${err.message}\n`);
 		}
+
+		await new Promise(resolve => setTimeout(resolve, 3000));
 	}
 
-	console.log('Бекфіл Slack: успішно завершено.');
+	process.stdout.write(`\x1b[2K\rБекфіл Slack: успішно завершено.\n`);
 }
 
 module.exports = { createSlackApp, runSlackBackfill };

@@ -386,4 +386,4 @@ async function setupTelegram(mainDoc, telegramClients, ourUserIds) {
 	console.log(`Telegram: підключено ${telegramClients.length} клієнт(и), слухаємо чатів: ${knownChatIds.length}`);
 }
 
-module.exports = { setupTelegram, runTelegramBackfill };
+module.exports = { setupTelegram, runTelegramBackfill, psChatMap };

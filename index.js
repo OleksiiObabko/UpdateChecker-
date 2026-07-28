@@ -10,6 +10,7 @@ const {
 const { initTelegramClients } = require('./services/telegram');
 const { setupTelegram, runTelegramBackfill } = require('./services/telegramHandler');
 const { createSlackApp, runSlackBackfill } = require('./services/slack');
+const { runMerchantSubmissionCycle } = require('./services/merchantSubmission');
 
 let targetSheets = [];
 let cacheCountdown = 300;
@@ -87,6 +88,15 @@ async function main() {
 		console.error('Помилка ініціалізації Telegram:', error);
 	}
 
+	if (tgClients.length > 0) {
+		try {
+			console.log('Виконуємо першу перевірку автоподачі...');
+			await runMerchantSubmissionCycle(mainDoc, externalDoc, tgClients);
+		} catch (error) {
+			console.error('Помилка першої автоподачі:', error);
+		}
+	}
+
 	if (state.activeTransactions.length > 0) {
 		await runSlackBackfill(mainDoc, slackApp.client);
 
@@ -105,9 +115,15 @@ async function main() {
 		if (cacheCountdown <= 0) {
 			cacheCountdown = 300;
 			try {
+				// 1. Оновлюємо кеш (зчитуємо нові статуси "send to ps")
 				await updateCacheShared(mainDoc, targetSheets);
+
+				// 2. Одразу після цього запускаємо автоподачу
+				if (state.activeTransactions.length > 0 && tgClients.length > 0) {
+					await runMerchantSubmissionCycle(mainDoc, externalDoc, tgClients);
+				}
 			} catch (error) {
-				console.error('Помилка оновлення кешу:', error.message);
+				console.error('Помилка оновлення кешу або автоподачі:', error.message);
 			}
 		}
 
@@ -143,7 +159,7 @@ async function main() {
 		const bM = Math.floor(backfillCountdown / 60).toString().padStart(2, '0');
 		const bS = (backfillCountdown % 60).toString().padStart(2, '0');
 
-		process.stdout.write(`\x1b[2K\rОновлення кешу: ${cM}:${cS} | umama: ${pM}:${pS} | Авто-бекфіл: ${bM}:${bS}`);
+		process.stdout.write(`\x1b[2K\rОновлення кешу (і подача): ${cM}:${cS} | umama: ${pM}:${pS} | Авто-бекфіл: ${bM}:${bS}`);
 	}, 1000);
 
 	await slackApp.start();

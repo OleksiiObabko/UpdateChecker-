@@ -13,10 +13,16 @@ const CURRENCY_SHEET_MAP = {
 const NON_FINAL_STATUSES = ['', 'в работе'];
 
 const rowsCache = new Map();
-const headerLoadedSheets = new Set(); // Додаємо сет для відстеження завантажених заголовків
 const CACHE_TTL_MS = 60000;
 
 async function getSheetRowsCached(sheet) {
+	try {
+		// eslint-disable-next-line no-unused-expressions
+		sheet.headerValues;
+	} catch {
+		await sheet.loadHeaderRow();
+	}
+
 	const now = Date.now();
 	const cached = rowsCache.get(sheet.sheetId);
 
@@ -28,16 +34,9 @@ async function getSheetRowsCached(sheet) {
 		let retries = 3;
 		while (retries > 0) {
 			try {
-				// Завантажуємо заголовки лише ОДИН РАЗ для кожного аркуша
-				if (!headerLoadedSheets.has(sheet.sheetId)) {
-					await sheet.loadHeaderRow();
-					headerLoadedSheets.add(sheet.sheetId);
-				}
 				return await sheet.getRows();
 			} catch (error) {
 				retries--;
-
-				// Якщо це помилка 429 (ліміти Google), робимо паузу 5 секунд
 				if (error.response && error.response.status === 429) {
 					console.error(`[Google API] Ліміт запитів 429. Чекаємо 5 сек... (залишилось спроб: ${retries})`);
 					if (retries === 0) throw error;
@@ -93,17 +92,21 @@ async function fetchActiveTransactions(doc, targetSheets) {
 			const psNameRaw = row.get('ПС');
 			const ourIdRaw = row.get(sheet.headerValues[3]);
 			const currencyRaw = row.get('Валюта') || row.get(sheet.headerValues[2]);
+			const merchantIdRaw = row.get('ID мерчанта');
+			const chatNameRaw = row.get('Чат');
+			const requestTypeRaw = row.get('Тип запиту'); // Зчитуємо тип запиту
 
 			const expectFrom = expectFromRaw ? expectFromRaw.toString().trim().toLowerCase() : '';
 			const status = statusRaw ? statusRaw.toString().trim().toLowerCase() : '';
 			const psName = psNameRaw ? psNameRaw.toString().trim().toLowerCase() : '';
 			const currency = currencyRaw ? currencyRaw.toString().trim().toUpperCase() : null;
+			const requestType = requestTypeRaw ? requestTypeRaw.toString().trim() : '';
 
 			const bankTxId = bankTransactionIdRaw ? bankTransactionIdRaw.toString().trim() : '';
 			const cpayId = cpayRaw ? cpayRaw.toString().trim() : '';
 			const ourId = ourIdRaw ? ourIdRaw.toString().trim() : '';
 
-			const isStatusValid = status === '' || status === 'in progress' || status === 'update';
+			const isStatusValid = status === '' || status === 'in progress' || status === 'update' || status === 'send to ps';
 			const isExpectFromValid = expectFrom === '' || expectFrom === 'пс';
 
 			if (isExpectFromValid && isStatusValid) {
@@ -120,12 +123,17 @@ async function fetchActiveTransactions(doc, targetSheets) {
 
 				if (trackingId !== '') {
 					activeTransactions.push({
-						transactionId: trackingId,
+						transactionId: trackingId,        // використовується існуючою логікою
+						ufId: ourId,                      // справжній ID UF
+						bankTransactionId: bankTxId,      // за бажанням, для дебагу
 						cpay: cpayId,
 						psName: psNameRaw,
 						sheetName: sheetName.trim(),
 						status: status,
-						currency
+						currency,
+						merchantId: merchantIdRaw ? merchantIdRaw.toString().trim() : '',
+						chatName: chatNameRaw ? chatNameRaw.toString().trim() : '',
+						requestType: requestType
 					});
 				}
 			}
@@ -299,5 +307,6 @@ module.exports = {
 	updateTransactionStatus,
 	findTransactionAnySheet,
 	initExternalSheets,
-	checkExternalPsUpdates
+	checkExternalPsUpdates,
+	CURRENCY_SHEET_MAP
 };

@@ -87,7 +87,7 @@ async function runSlackBackfill(doc, client) {
 	for (const tx of targetTxs) {
 		try {
 			const searchRes = await client.search.messages({
-				query: tx.transactionId,
+				query: `"${tx.transactionId}"`,
 				count: 20,
 				sort: 'timestamp',
 				sort_dir: 'desc',
@@ -109,8 +109,8 @@ async function runSlackBackfill(doc, client) {
 
 					if (!threadRes.messages || threadRes.messages.length === 0) continue;
 
-					const parentText = threadRes.messages[0].text || '';
-					if (!parentText.includes(tx.transactionId)) continue;
+					const parentText = (threadRes.messages[0].text || '').toLowerCase();
+					if (!parentText.includes(tx.transactionId.toString().toLowerCase())) continue;
 
 					const psType = getPsType(tx.psName);
 					const ourUserId = process.env.OUR_SLACK_USER_ID;
@@ -127,7 +127,7 @@ async function runSlackBackfill(doc, client) {
 			process.stdout.write(`\x1b[2K\rПомилка бекфілу Slack для ${tx.transactionId}: ${err.message}\n`);
 		}
 
-		await new Promise(resolve => setTimeout(resolve, 3000));
+		await new Promise(resolve => setTimeout(resolve, 4500));
 	}
 
 	process.stdout.write(`\x1b[2K\rБекфіл Slack: успішно завершено.\n`);

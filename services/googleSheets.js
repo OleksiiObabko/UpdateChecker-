@@ -12,6 +12,48 @@ const CURRENCY_SHEET_MAP = {
 
 const NON_FINAL_STATUSES = ['', 'в работе'];
 
+const rowsCache = new Map();
+const headerLoadedSheets = new Set(); // Додаємо сет для відстеження завантажених заголовків
+const CACHE_TTL_MS = 60000;
+
+async function getSheetRowsCached(sheet) {
+	const now = Date.now();
+	const cached = rowsCache.get(sheet.sheetId);
+
+	if (cached && now - cached.timestamp < CACHE_TTL_MS) {
+		return cached.promise;
+	}
+
+	const promise = (async () => {
+		let retries = 3;
+		while (retries > 0) {
+			try {
+				// Завантажуємо заголовки лише ОДИН РАЗ для кожного аркуша
+				if (!headerLoadedSheets.has(sheet.sheetId)) {
+					await sheet.loadHeaderRow();
+					headerLoadedSheets.add(sheet.sheetId);
+				}
+				return await sheet.getRows();
+			} catch (error) {
+				retries--;
+
+				// Якщо це помилка 429 (ліміти Google), робимо паузу 5 секунд
+				if (error.response && error.response.status === 429) {
+					console.error(`[Google API] Ліміт запитів 429. Чекаємо 5 сек... (залишилось спроб: ${retries})`);
+					if (retries === 0) throw error;
+					await new Promise(resolve => setTimeout(resolve, 5000));
+				} else {
+					if (retries === 0) throw error;
+					await new Promise(resolve => setTimeout(resolve, 2000));
+				}
+			}
+		}
+	})();
+
+	rowsCache.set(sheet.sheetId, { promise, timestamp: now });
+	return promise;
+}
+
 function createServiceAccountAuth() {
 	return new JWT({
 		email: credentials.client_email,
@@ -35,12 +77,14 @@ async function initExternalSheets() {
 async function fetchActiveTransactions(doc, targetSheets) {
 	const activeTransactions = [];
 	const slackPsList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
+	const slackTicketPsList = process.env.SLACK_TICKET_PS ? process.env.SLACK_TICKET_PS.split(',').map(s => s.trim().toLowerCase()) : [];
+	const allSlackPs = [...slackPsList, ...slackTicketPsList];
 
 	for (const sheetName of targetSheets) {
 		const sheet = doc.sheetsByTitle[sheetName.trim()];
 		if (!sheet) continue;
 
-		const rows = await sheet.getRows();
+		const rows = await getSheetRowsCached(sheet);
 		for (const row of rows) {
 			const expectFromRaw = row.get('Від кого очікуємо відповідь');
 			const statusRaw = row.get('Статус');
@@ -63,7 +107,7 @@ async function fetchActiveTransactions(doc, targetSheets) {
 			const isExpectFromValid = expectFrom === '' || expectFrom === 'пс';
 
 			if (isExpectFromValid && isStatusValid) {
-				const isSlackPs = slackPsList.includes(psName);
+				const isSlackPs = allSlackPs.includes(psName);
 				let trackingId = '';
 
 				if (isSlackPs && ourId !== '') {
@@ -94,11 +138,10 @@ async function fetchActiveTransactions(doc, targetSheets) {
 async function updateTransactionStatus(doc, sheetName, transactionId, newStatus) {
 	const sheet = doc.sheetsByTitle[sheetName];
 	if (!sheet) {
-		console.error(`Аркуш "${sheetName}" не знайдено в основній таблиці`);
 		return false;
 	}
 
-	const rows = await sheet.getRows();
+	const rows = await getSheetRowsCached(sheet);
 
 	const row = rows.findLast(r => {
 		const bankId = r.get('status.bankTransactionId');
@@ -113,7 +156,6 @@ async function updateTransactionStatus(doc, sheetName, transactionId, newStatus)
 	});
 
 	if (!row) {
-		console.error(`Рядок для ID ${transactionId} не знайдено в "${sheetName}" (видалений/змінений?)`);
 		return false;
 	}
 
@@ -129,7 +171,7 @@ async function findTransactionAnySheet(doc, targetSheets, transactionId) {
 		const sheet = doc.sheetsByTitle[sheetName.trim()];
 		if (!sheet) continue;
 
-		const rows = await sheet.getRows();
+		const rows = await getSheetRowsCached(sheet);
 
 		const row = rows.findLast(r => {
 			const bankId = r.get('status.bankTransactionId');
@@ -157,7 +199,7 @@ async function findTransactionInExternalSheets(externalDoc, tx, sheetCache) {
 		if (!sheet) continue;
 
 		if (!sheetCache.has(sheetName)) {
-			sheetCache.set(sheetName, await sheet.getRows());
+			sheetCache.set(sheetName, await getSheetRowsCached(sheet));
 		}
 		const rows = sheetCache.get(sheetName);
 
@@ -212,7 +254,7 @@ async function checkExternalPsUpdates(doc, externalDoc, transactions) {
 			if (!mainSheet) continue;
 
 			if (!mainSheetRowsCache.has(tx.sheetName)) {
-				mainSheetRowsCache.set(tx.sheetName, await mainSheet.getRows());
+				mainSheetRowsCache.set(tx.sheetName, await getSheetRowsCached(mainSheet));
 			}
 			const mainRows = mainSheetRowsCache.get(tx.sheetName);
 
@@ -247,7 +289,7 @@ async function checkExternalPsUpdates(doc, externalDoc, transactions) {
 			logStatusChange('umama', tx, previousStatus, 'update');
 		}
 	} catch (error) {
-		console.error('Помилка перевірки umama:', error.message);
+		console.error(error.message);
 	}
 }
 

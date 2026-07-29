@@ -94,7 +94,7 @@ async function fetchActiveTransactions(doc, targetSheets) {
 			const currencyRaw = row.get('Валюта') || row.get(sheet.headerValues[2]);
 			const merchantIdRaw = row.get('ID мерчанта');
 			const chatNameRaw = row.get('Чат');
-			const requestTypeRaw = row.get('Тип запиту'); // Зчитуємо тип запиту
+			const requestTypeRaw = row.get('Тип запиту');
 
 			const expectFrom = expectFromRaw ? expectFromRaw.toString().trim().toLowerCase() : '';
 			const status = statusRaw ? statusRaw.toString().trim().toLowerCase() : '';
@@ -123,9 +123,9 @@ async function fetchActiveTransactions(doc, targetSheets) {
 
 				if (trackingId !== '') {
 					activeTransactions.push({
-						transactionId: trackingId,        // використовується існуючою логікою
-						ufId: ourId,                      // справжній ID UF
-						bankTransactionId: bankTxId,      // за бажанням, для дебагу
+						transactionId: trackingId,
+						ufId: ourId,
+						bankTransactionId: bankTxId,
 						cpay: cpayId,
 						psName: psNameRaw,
 						sheetName: sheetName.trim(),
@@ -167,8 +167,34 @@ async function updateTransactionStatus(doc, sheetName, transactionId, newStatus)
 		return false;
 	}
 
-	row.set('Статус', newStatus);
-	await row.save();
+	// Замість row.save() використовуємо точкове збереження клітинки
+	const colIndex = sheet.headerValues.indexOf('Статус');
+	const rowIndex = row.rowNumber - 1; // Індекси рядків для loadCells починаються з 0
+
+	if (colIndex !== -1) {
+		// 1. Завантажуємо лише потрібну клітинку з API
+		await sheet.loadCells({
+			startRowIndex: rowIndex,
+			endRowIndex: rowIndex + 1,
+			startColumnIndex: colIndex,
+			endColumnIndex: colIndex + 1
+		});
+
+		// 2. Вносимо нове значення в неї
+		const cell = sheet.getCell(rowIndex, colIndex);
+		cell.value = newStatus;
+
+		// 3. Зберігаємо (API надішле зміни лише для цієї клітинки)
+		await sheet.saveUpdatedCells();
+
+		// 4. Оновлюємо значення в пам'яті скрипта, щоб кеш також знав про зміни
+		row.set('Статус', newStatus);
+	} else {
+		// Фолбек, якщо колонку "Статус" чомусь не знайдено (надійність)
+		row.set('Статус', newStatus);
+		await row.save();
+	}
+
 	return true;
 }
 
@@ -281,16 +307,44 @@ async function checkExternalPsUpdates(doc, externalDoc, transactions) {
 			if (!row) continue;
 
 			const previousStatus = tx.status;
-			row.set('Статус', 'update');
-
 			const currentComment = row.get('Дод.коментарі/задача') ? row.get('Дод.коментарі/задача').toString().trim() : '';
 			const newComment = currentComment
 				? `${currentComment}\n${textToAdd}`
 				: textToAdd;
 
-			row.set('Дод.коментарі/задача', newComment);
+			// Зберігаємо точково "Статус" і "Коментарі", щоб не зачіпати інші стовпці
+			const statusColIndex = mainSheet.headerValues.indexOf('Статус');
+			const commentColIndex = mainSheet.headerValues.indexOf('Дод.коментарі/задача');
+			const rowIndex = row.rowNumber - 1;
 
-			await row.save();
+			if (statusColIndex !== -1 && commentColIndex !== -1) {
+				const minCol = Math.min(statusColIndex, commentColIndex);
+				const maxCol = Math.max(statusColIndex, commentColIndex);
+
+				await mainSheet.loadCells({
+					startRowIndex: rowIndex,
+					endRowIndex: rowIndex + 1,
+					startColumnIndex: minCol,
+					endColumnIndex: maxCol + 1
+				});
+
+				const statusCell = mainSheet.getCell(rowIndex, statusColIndex);
+				statusCell.value = 'update';
+
+				const commentCell = mainSheet.getCell(rowIndex, commentColIndex);
+				commentCell.value = newComment;
+
+				await mainSheet.saveUpdatedCells();
+
+				// Оновлюємо внутрішні змінні об'єкта row
+				row.set('Статус', 'update');
+				row.set('Дод.коментарі/задача', newComment);
+			} else {
+				row.set('Статус', 'update');
+				row.set('Дод.коментарі/задача', newComment);
+				await row.save();
+			}
+
 			tx.status = 'update';
 
 			state.stats.updatesProvided++;

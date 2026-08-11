@@ -1,23 +1,15 @@
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 const credentials = require('../credentials.json');
-const { logStatusChange } = require('./statusLog');
 const state = require('./state');
 
 const SHEET_ID = process.env.SHEET_ID;
-
-const CURRENCY_SHEET_MAP = {
-	'INR': ['all INR', 'ASAP INR']
-};
-
-const NON_FINAL_STATUSES = ['', 'в работе'];
 
 const rowsCache = new Map();
 const CACHE_TTL_MS = 60000;
 
 async function getSheetRowsCached(sheet) {
 	try {
-		// eslint-disable-next-line no-unused-expressions
 		sheet.headerValues;
 	} catch {
 		await sheet.loadHeaderRow();
@@ -38,7 +30,6 @@ async function getSheetRowsCached(sheet) {
 			} catch (error) {
 				retries--;
 				if (error.response && error.response.status === 429) {
-					console.error(`[Google API] Ліміт запитів 429. Чекаємо 5 сек... (залишилось спроб: ${retries})`);
 					if (retries === 0) throw error;
 					await new Promise(resolve => setTimeout(resolve, 5000));
 				} else {
@@ -67,12 +58,6 @@ async function initGoogleSheets() {
 	return doc;
 }
 
-async function initExternalSheets() {
-	const doc = new GoogleSpreadsheet(process.env.EXTERNAL_PS_SHEET_ID, createServiceAccountAuth());
-	await doc.loadInfo();
-	return doc;
-}
-
 async function fetchActiveTransactions(doc, targetSheets) {
 	const activeTransactions = [];
 	const slackPsList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
@@ -95,12 +80,14 @@ async function fetchActiveTransactions(doc, targetSheets) {
 			const merchantIdRaw = row.get('ID мерчанта');
 			const chatNameRaw = row.get('Чат');
 			const requestTypeRaw = row.get('Тип запиту');
+			const methodRaw = row.get('Метод');
 
 			const expectFrom = expectFromRaw ? expectFromRaw.toString().trim().toLowerCase() : '';
 			const status = statusRaw ? statusRaw.toString().trim().toLowerCase() : '';
 			const psName = psNameRaw ? psNameRaw.toString().trim().toLowerCase() : '';
 			const currency = currencyRaw ? currencyRaw.toString().trim().toUpperCase() : null;
 			const requestType = requestTypeRaw ? requestTypeRaw.toString().trim() : '';
+			const method = methodRaw ? methodRaw.toString().trim() : '';
 
 			const bankTxId = bankTransactionIdRaw ? bankTransactionIdRaw.toString().trim() : '';
 			const cpayId = cpayRaw ? cpayRaw.toString().trim() : '';
@@ -133,7 +120,8 @@ async function fetchActiveTransactions(doc, targetSheets) {
 						currency,
 						merchantId: merchantIdRaw ? merchantIdRaw.toString().trim() : '',
 						chatName: chatNameRaw ? chatNameRaw.toString().trim() : '',
-						requestType: requestType
+						requestType: requestType,
+						method: method
 					});
 				}
 			}
@@ -145,9 +133,7 @@ async function fetchActiveTransactions(doc, targetSheets) {
 
 async function updateTransactionStatus(doc, sheetName, transactionId, newStatus) {
 	const sheet = doc.sheetsByTitle[sheetName];
-	if (!sheet) {
-		return false;
-	}
+	if (!sheet) return false;
 
 	const rows = await getSheetRowsCached(sheet);
 
@@ -155,7 +141,6 @@ async function updateTransactionStatus(doc, sheetName, transactionId, newStatus)
 		const bankId = r.get('status.bankTransactionId');
 		const ourId = r.get(sheet.headerValues[3]);
 		const cpay = r.get('Cpay');
-
 		const targetId = transactionId.toString().trim();
 
 		return (bankId && bankId.toString().trim() === targetId) ||
@@ -163,34 +148,23 @@ async function updateTransactionStatus(doc, sheetName, transactionId, newStatus)
 			(cpay && cpay.toString().trim() === targetId);
 	});
 
-	if (!row) {
-		return false;
-	}
+	if (!row) return false;
 
-	// Замість row.save() використовуємо точкове збереження клітинки
 	const colIndex = sheet.headerValues.indexOf('Статус');
-	const rowIndex = row.rowNumber - 1; // Індекси рядків для loadCells починаються з 0
+	const rowIndex = row.rowNumber - 1;
 
 	if (colIndex !== -1) {
-		// 1. Завантажуємо лише потрібну клітинку з API
 		await sheet.loadCells({
-			startRowIndex: rowIndex,
-			endRowIndex: rowIndex + 1,
-			startColumnIndex: colIndex,
-			endColumnIndex: colIndex + 1
+			startRowIndex: rowIndex, endRowIndex: rowIndex + 1,
+			startColumnIndex: colIndex, endColumnIndex: colIndex + 1
 		});
 
-		// 2. Вносимо нове значення в неї
-		const cell = sheet.getCell(rowIndex, colIndex);
-		cell.value = newStatus;
+		const statusCell = sheet.getCell(rowIndex, colIndex);
+		statusCell.value = newStatus;
 
-		// 3. Зберігаємо (API надішле зміни лише для цієї клітинки)
 		await sheet.saveUpdatedCells();
-
-		// 4. Оновлюємо значення в пам'яті скрипта, щоб кеш також знав про зміни
 		row.set('Статус', newStatus);
 	} else {
-		// Фолбек, якщо колонку "Статус" чомусь не знайдено (надійність)
 		row.set('Статус', newStatus);
 		await row.save();
 	}
@@ -206,7 +180,6 @@ async function findTransactionAnySheet(doc, targetSheets, transactionId) {
 		if (!sheet) continue;
 
 		const rows = await getSheetRowsCached(sheet);
-
 		const row = rows.findLast(r => {
 			const bankId = r.get('status.bankTransactionId');
 			const ourId = r.get(sheet.headerValues[3]);
@@ -217,150 +190,14 @@ async function findTransactionAnySheet(doc, targetSheets, transactionId) {
 				(cpay && cpay.toString().trim() === targetId);
 		});
 
-		if (row) {
-			return { sheetName: sheetName.trim(), row };
-		}
+		if (row) return { sheetName: sheetName.trim(), row };
 	}
 	return null;
-}
-
-async function findTransactionInExternalSheets(externalDoc, tx, sheetCache) {
-	const candidates = CURRENCY_SHEET_MAP[tx.currency] || [];
-	if (candidates.length === 0) return null;
-
-	for (const sheetName of candidates) {
-		const sheet = externalDoc.sheetsByTitle[sheetName];
-		if (!sheet) continue;
-
-		if (!sheetCache.has(sheetName)) {
-			sheetCache.set(sheetName, await getSheetRowsCached(sheet));
-		}
-		const rows = sheetCache.get(sheetName);
-
-		const matches = rows.filter(r => {
-			const ufId = r.get('UF ID');
-			const orderId = r.get('Order ID');
-			return (ufId && ufId.toString().trim() === tx.transactionId.toString().trim()) ||
-				(orderId && orderId.toString().trim() === tx.transactionId.toString().trim());
-		});
-
-		if (matches.length === 0) continue;
-
-		const row = matches[matches.length - 1];
-		return { row, sheetName };
-	}
-	return null;
-}
-
-async function checkExternalPsUpdates(doc, externalDoc, transactions) {
-	try {
-		const externalPsNames = process.env.EXTERNAL_PS_NAMES
-			? process.env.EXTERNAL_PS_NAMES.split(',').map(s => s.trim().toLowerCase())
-			: [];
-
-		const activeTransactions = transactions.filter(tx =>
-			externalPsNames.includes((tx.psName || '').toLowerCase()) && tx.status.toLowerCase() === 'in progress'
-		);
-
-		if (activeTransactions.length === 0) return;
-
-		const sheetCache = new Map();
-		const mainSheetRowsCache = new Map();
-
-		for (const tx of activeTransactions) {
-			const found = await findTransactionInExternalSheets(externalDoc, tx, sheetCache);
-			if (!found) continue;
-
-			const originalStatusText = found.row.get('Status') ? found.row.get('Status').toString().trim() : '';
-			const rowStatus = originalStatusText.toLowerCase();
-
-			if (NON_FINAL_STATUSES.includes(rowStatus)) continue;
-
-			let textToAdd = originalStatusText;
-			if (rowStatus !== 'в работе') {
-				const commentText = found.row.get('Comment') ? found.row.get('Comment').toString().trim() : '';
-				if (commentText) {
-					textToAdd = `${originalStatusText} | ${commentText}`;
-				}
-			}
-
-			const mainSheet = doc.sheetsByTitle[tx.sheetName];
-			if (!mainSheet) continue;
-
-			if (!mainSheetRowsCache.has(tx.sheetName)) {
-				mainSheetRowsCache.set(tx.sheetName, await getSheetRowsCached(mainSheet));
-			}
-			const mainRows = mainSheetRowsCache.get(tx.sheetName);
-
-			const row = mainRows.findLast(r => {
-				const bankId = r.get('status.bankTransactionId');
-				const ourId = r.get(mainSheet.headerValues[3]);
-				const cpay = r.get('Cpay');
-
-				const targetId = tx.transactionId.toString().trim();
-
-				return (bankId && bankId.toString().trim() === targetId) ||
-					(ourId && ourId.toString().trim() === targetId) ||
-					(cpay && cpay.toString().trim() === targetId);
-			});
-
-			if (!row) continue;
-
-			const previousStatus = tx.status;
-			const currentComment = row.get('Дод.коментарі/задача') ? row.get('Дод.коментарі/задача').toString().trim() : '';
-			const newComment = currentComment
-				? `${currentComment}\n${textToAdd}`
-				: textToAdd;
-
-			// Зберігаємо точково "Статус" і "Коментарі", щоб не зачіпати інші стовпці
-			const statusColIndex = mainSheet.headerValues.indexOf('Статус');
-			const commentColIndex = mainSheet.headerValues.indexOf('Дод.коментарі/задача');
-			const rowIndex = row.rowNumber - 1;
-
-			if (statusColIndex !== -1 && commentColIndex !== -1) {
-				const minCol = Math.min(statusColIndex, commentColIndex);
-				const maxCol = Math.max(statusColIndex, commentColIndex);
-
-				await mainSheet.loadCells({
-					startRowIndex: rowIndex,
-					endRowIndex: rowIndex + 1,
-					startColumnIndex: minCol,
-					endColumnIndex: maxCol + 1
-				});
-
-				const statusCell = mainSheet.getCell(rowIndex, statusColIndex);
-				statusCell.value = 'update';
-
-				const commentCell = mainSheet.getCell(rowIndex, commentColIndex);
-				commentCell.value = newComment;
-
-				await mainSheet.saveUpdatedCells();
-
-				// Оновлюємо внутрішні змінні об'єкта row
-				row.set('Статус', 'update');
-				row.set('Дод.коментарі/задача', newComment);
-			} else {
-				row.set('Статус', 'update');
-				row.set('Дод.коментарі/задача', newComment);
-				await row.save();
-			}
-
-			tx.status = 'update';
-
-			state.stats.updatesProvided++;
-			logStatusChange('umama', tx, previousStatus, 'update');
-		}
-	} catch (error) {
-		console.error(error.message);
-	}
 }
 
 module.exports = {
 	initGoogleSheets,
 	fetchActiveTransactions,
 	updateTransactionStatus,
-	findTransactionAnySheet,
-	initExternalSheets,
-	checkExternalPsUpdates,
-	CURRENCY_SHEET_MAP
+	findTransactionAnySheet
 };

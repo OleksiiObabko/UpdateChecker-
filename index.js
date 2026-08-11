@@ -2,11 +2,7 @@ require('dotenv').config();
 const prompts = require('prompts');
 const state = require('./services/state');
 const { updateCacheShared } = require('./services/cache');
-const {
-	initGoogleSheets,
-	initExternalSheets,
-	checkExternalPsUpdates
-} = require('./services/googleSheets');
+const { initGoogleSheets } = require('./services/googleSheets');
 const { initTelegramClients } = require('./services/telegram');
 const { setupTelegram, runTelegramBackfill } = require('./services/telegramHandler');
 const { createSlackApp, runSlackBackfill } = require('./services/slack');
@@ -14,7 +10,6 @@ const { runMerchantSubmissionCycle } = require('./services/merchantSubmission');
 
 let targetSheets = [];
 let cacheCountdown = 300;
-let psCountdown = 345;
 let backfillCountdown = 630;
 
 const originalLog = console.log;
@@ -29,7 +24,8 @@ console.error = function (...args) {
 	originalError.apply(console, args);
 };
 
-const ALL_SHEETS = ['Кити', 'Омнік', 'Лелеки', 'Фікси', 'Дракони', 'Корівки', 'Вулик'];
+// const ALL_SHEETS = ['Кити', 'Омнік', 'Лелеки', 'Фікси', 'Дракони', 'Корівки', 'Вулик'];
+const ALL_SHEETS = ['Корівки', 'Вулик'];
 
 async function promptSheetSelection() {
 	const response = await prompts({
@@ -67,7 +63,6 @@ async function main() {
 	state.targetSheets = targetSheets;
 
 	const mainDoc = await initGoogleSheets();
-	const externalDoc = await initExternalSheets();
 
 	await updateCacheShared(mainDoc, targetSheets);
 
@@ -92,7 +87,7 @@ async function main() {
 	if (tgClients.length > 0) {
 		try {
 			console.log('Виконуємо першу перевірку автоподачі...');
-			await runMerchantSubmissionCycle(mainDoc, externalDoc, tgClients);
+			await runMerchantSubmissionCycle(mainDoc, tgClients);
 		} catch (error) {
 			console.error('Помилка першої автоподачі:', error);
 		}
@@ -100,42 +95,21 @@ async function main() {
 
 	if (state.activeTransactions.length > 0) {
 		await runSlackBackfill(mainDoc, slackApp.client);
-
-		try {
-			await checkExternalPsUpdates(mainDoc, externalDoc, state.activeTransactions);
-		} catch (error) {
-			console.error('Помилка першої перевірки umama:', error);
-		}
 	}
 
 	setInterval(async () => {
 		cacheCountdown--;
-		psCountdown--;
 		backfillCountdown--;
 
 		if (cacheCountdown <= 0) {
 			cacheCountdown = 300;
 			try {
-				// 1. Оновлюємо кеш (зчитуємо нові статуси "send to ps")
 				await updateCacheShared(mainDoc, targetSheets);
-
-				// 2. Одразу після цього запускаємо автоподачу
 				if (state.activeTransactions.length > 0 && tgClients.length > 0) {
-					await runMerchantSubmissionCycle(mainDoc, externalDoc, tgClients);
+					await runMerchantSubmissionCycle(mainDoc, tgClients);
 				}
 			} catch (error) {
 				console.error('Помилка оновлення кешу або автоподачі:', error.message);
-			}
-		}
-
-		if (psCountdown <= 0) {
-			psCountdown = 300;
-			if (state.activeTransactions.length > 0) {
-				try {
-					await checkExternalPsUpdates(mainDoc, externalDoc, state.activeTransactions);
-				} catch (error) {
-					console.error('Помилка перевірки umama:', error);
-				}
 			}
 		}
 
@@ -155,12 +129,10 @@ async function main() {
 
 		const cM = Math.floor(cacheCountdown / 60).toString().padStart(2, '0');
 		const cS = (cacheCountdown % 60).toString().padStart(2, '0');
-		const pM = Math.floor(psCountdown / 60).toString().padStart(2, '0');
-		const pS = (psCountdown % 60).toString().padStart(2, '0');
 		const bM = Math.floor(backfillCountdown / 60).toString().padStart(2, '0');
 		const bS = (backfillCountdown % 60).toString().padStart(2, '0');
 
-		process.stdout.write(`\x1b[2K\rОновлення кешу (і подача): ${cM}:${cS} | umama: ${pM}:${pS} | Авто-бекфіл: ${bM}:${bS}`);
+		process.stdout.write(`\x1b[2K\rОновлення кешу (і подача): ${cM}:${cS} | Авто-бекфіл: ${bM}:${bS}`);
 	}, 1000);
 
 	await slackApp.start();

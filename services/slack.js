@@ -1,6 +1,6 @@
 const { App } = require('@slack/bolt');
 const state = require('./state');
-const { resolveTransactionById } = require('./slackUtils');
+const { resolveTransactionById, applyStatusFromMatch } = require('./slackUtils');
 const { handleStandardSlackMessage, processStandardBackfillThread } = require('./slackStandard');
 const { handleTicketSlackMessage, processTicketBackfillThread } = require('./slackTicket');
 
@@ -64,6 +64,56 @@ function createSlackApp() {
 		}
 	});
 
+	slackApp.event('reaction_added', async ({ event, client }) => {
+		try {
+			if (event.item.type !== 'message') return;
+
+			const channel = event.item.channel;
+			const ts = event.item.ts;
+
+			const history = await client.conversations.history({
+				channel: channel,
+				latest: ts,
+				limit: 1,
+				inclusive: true
+			});
+
+			const msg = history.messages && history.messages[0];
+			if (!msg) return;
+
+			let parentText = '';
+
+			if (msg.thread_ts) {
+				if (msg.ts === msg.thread_ts) {
+					parentText = msg.text;
+				} else {
+					const threadData = await client.conversations.replies({
+						channel: channel,
+						ts: msg.thread_ts,
+						limit: 1
+					});
+					if (threadData.messages && threadData.messages[0]) {
+						parentText = threadData.messages[0].text;
+					}
+				}
+			} else {
+				parentText = msg.text;
+			}
+
+			if (!parentText) return;
+
+			const match = parentText.match(/\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}|\d+)\b/);
+			if (!match) return;
+
+			const transactionId = match[1];
+			const matchedTx = await resolveTransactionById(transactionId);
+			if (!matchedTx) return;
+
+			await applyStatusFromMatch('Slack, reaction', matchedTx, 'in progress');
+		} catch (error) {
+		}
+	});
+
 	return slackApp;
 }
 
@@ -81,8 +131,6 @@ async function runSlackBackfill(doc, client) {
 	});
 
 	if (targetTxs.length === 0) return;
-
-	process.stdout.write(`\x1b[2K\rБекфіл Slack: перевіряю ${targetTxs.length} транзакцій...\n`);
 
 	for (const tx of targetTxs) {
 		try {

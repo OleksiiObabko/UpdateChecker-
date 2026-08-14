@@ -30,7 +30,8 @@ async function processTicketBackfillThread(tx, ourUserId, threadMessages) {
 
 	const lastReply = validMessages[validMessages.length - 1];
 	const isFromUs = lastReply.user === ourUserId;
-	const newStatus = isFromUs ? 'in progress' : 'update';
+	const hasReaction = lastReply.reactions && lastReply.reactions.length > 0;
+	const newStatus = (isFromUs || hasReaction) ? 'in progress' : 'update';
 
 	await applyStatusFromMatch('Slack [Ticket], backfill', tx, newStatus);
 }

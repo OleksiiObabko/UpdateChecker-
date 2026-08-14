@@ -20,7 +20,8 @@ async function processStandardBackfillThread(tx, ourUserId, threadMessages) {
 
 	const lastReply = threadMessages[threadMessages.length - 1];
 	const isFromUs = lastReply.user === ourUserId;
-	const newStatus = isFromUs ? 'in progress' : 'update';
+	const hasReaction = lastReply.reactions && lastReply.reactions.length > 0;
+	const newStatus = (isFromUs || hasReaction) ? 'in progress' : 'update';
 
 	await applyStatusFromMatch('Slack [Standard], backfill', tx, newStatus);
 }

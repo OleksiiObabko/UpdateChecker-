@@ -194,6 +194,35 @@ function makeTelegramMessageHandler(doc, client, ourUserIds) {
 	};
 }
 
+function makeReactionHandler(doc) {
+	return async (event) => {
+		if (event && (event.className === 'UpdateMessageReactions' || event.className === 'UpdateBotMessageReaction')) {
+			const msgId = event.msgId;
+			if (!msgId) return;
+
+			const tx = globalMessageCache.get(msgId);
+			if (!tx) return;
+
+			const hasReactions = event.reactions && event.reactions.results && event.reactions.results.length > 0;
+
+			if (hasReactions) {
+				const newStatus = 'in progress';
+				const currentStatus = (tx.status || '').toString().trim().toLowerCase();
+
+				if (currentStatus !== newStatus) {
+					tx.status = newStatus;
+					const txIndex = state.activeTransactions.findIndex(t => t.transactionId === tx.transactionId);
+					if (txIndex !== -1) state.activeTransactions[txIndex].status = newStatus;
+
+					try {
+						await updateTransactionStatus(doc, tx.sheetName, tx.transactionId, newStatus);
+					} catch (err) {}
+				}
+			}
+		}
+	};
+}
+
 const chatRecentCache = new Map();
 
 async function findTransactionMessagesInChat(clients, chatId, searchTerm, cutoffTimestamp) {
@@ -259,7 +288,10 @@ async function applyFinalStatusFromMessages(doc, tx, messages, ourUserIds) {
 
 	const senderId = lastMessage.senderId ? lastMessage.senderId.toString() : null;
 	const isFromUs = ourUserIds.includes(senderId);
-	const newStatus = isFromUs ? 'in progress' : 'update';
+
+	const hasReaction = lastMessage.reactions && lastMessage.reactions.results && lastMessage.reactions.results.length > 0;
+
+	const newStatus = (isFromUs || hasReaction) ? 'in progress' : 'update';
 
 	const currentStatus = (tx.status || '').toString().trim().toLowerCase();
 
@@ -288,16 +320,35 @@ async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = fals
 	const slackTicketPsList = process.env.SLACK_TICKET_PS ? process.env.SLACK_TICKET_PS.split(',').map(s => s.trim().toLowerCase()) : [];
 	const externalPsNames = process.env.EXTERNAL_PS_NAMES ? process.env.EXTERNAL_PS_NAMES.split(',').map(s => s.trim().toLowerCase()) : [];
 
+	const initialActiveCount = state.activeTransactions.filter(tx => {
+		const status = (tx.status || '').toString().trim().toLowerCase();
+		return status === '' || status === 'in progress';
+	}).length;
+
+	let totalMatched = 0;
+	let updatedCount = 0;
+	let skippedNoChat = 0;
+	const unmonitoredPsNames = new Set();
+
+	if (isInitialRun) {
+		console.log(`Бекфіл Telegram: перевіряю ${state.activeTransactions.length} транзакцій по відповідних чатах ПС (за ${BACKFILL_DAYS} дн.)...`);
+	}
+
 	for (const tx of state.activeTransactions) {
 		const psName = (tx.psName || '').toString().trim().toLowerCase();
 		const chatIds = psChatMap.get(psName);
 
 		if (!chatIds || chatIds.length === 0) {
+			skippedNoChat++;
+			if (psName && !slackPsList.includes(psName) && !slackTicketPsList.includes(psName) && !externalPsNames.includes(psName)) {
+				unmonitoredPsNames.add(psName);
+			}
 			continue;
 		}
 
 		const searchTerm = tx.transactionId || tx.cpay;
 		if (!searchTerm) {
+			skippedNoChat++;
 			continue;
 		}
 
@@ -309,15 +360,35 @@ async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = fals
 
 		if (allMessages.length === 0) continue;
 
-		await applyFinalStatusFromMessages(doc, tx, allMessages, ourUserIds);
+		totalMatched += allMessages.length;
+		const changed = await applyFinalStatusFromMessages(doc, tx, allMessages, ourUserIds);
+		if (changed) updatedCount++;
+	}
+
+	const remainingActiveCount = state.activeTransactions.filter(tx => {
+		const status = (tx.status || '').toString().trim().toLowerCase();
+		return status === '' || status === 'in progress';
+	}).length;
+
+	if (isInitialRun) {
+		console.log(`Бекфіл Telegram завершено.`);
+		console.log(`  Активних запитів на початку: ${initialActiveCount}`);
+		console.log(`  Надано апдейтів статусу: ${updatedCount}`);
+		console.log(`  Активних запитів лишилось: ${remainingActiveCount}`);
+		console.log(`  Опрацьовано повідомлень: ${totalMatched}. Транзакцій без чату: ${skippedNoChat}`);
+
+		if (unmonitoredPsNames.size > 0) {
+			console.log(`  [УВАГА] Не стежимо за цими ПС: ${Array.from(unmonitoredPsNames).join(', ')}`);
+		}
 	}
 }
 
 async function setupTelegram(mainDoc, telegramClients, ourUserIds) {
-	const { NewMessage } = require('telegram/events');
+	const { NewMessage, Raw } = require('telegram/events');
 	await runTelegramBackfill(mainDoc, telegramClients, ourUserIds, true);
 	for (const client of telegramClients) {
 		client.addEventHandler(makeTelegramMessageHandler(mainDoc, client, ourUserIds), new NewMessage({}));
+		client.addEventHandler(makeReactionHandler(mainDoc), new Raw({}));
 	}
 }
 

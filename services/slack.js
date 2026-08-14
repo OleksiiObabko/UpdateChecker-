@@ -118,6 +118,7 @@ function createSlackApp() {
 }
 
 async function runSlackBackfill(doc, client) {
+	process.stdout.write(`\x1b[2K\rБекфіл Slack: розпочато...\n`);
 	const standardList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
 	const ticketList = process.env.SLACK_TICKET_PS ? process.env.SLACK_TICKET_PS.split(',').map(s => s.trim().toLowerCase()) : [];
 	const allSlackPs = [...standardList, ...ticketList];

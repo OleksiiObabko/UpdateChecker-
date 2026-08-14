@@ -40,6 +40,13 @@ async function getSheetRowsCached(sheet) {
 		}
 	})();
 
+	promise.catch(() => {
+		const current = rowsCache.get(sheet.sheetId);
+		if (current && current.promise === promise) {
+			rowsCache.delete(sheet.sheetId);
+		}
+	});
+
 	rowsCache.set(sheet.sheetId, { promise, timestamp: now });
 	return promise;
 }

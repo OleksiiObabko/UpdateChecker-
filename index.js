@@ -68,9 +68,8 @@ async function main() {
 
 	const sheetsLogName = targetSheets.length > 1 ? 'Усі аркуші' : targetSheets[0];
 	console.log(`\nЗапуск моніторингу для: ${sheetsLogName}`);
-	console.log(`Початок запуску процесів...\n`);
 
-	const slackApp = createSlackApp();
+	const slackApp = createSlackApp(mainDoc);
 
 	let tgClients = [];
 	let tgUserIds = [];
@@ -88,6 +87,7 @@ async function main() {
 		try {
 			console.log('Виконуємо першу перевірку автоподачі...');
 			await runMerchantSubmissionCycle(mainDoc, tgClients);
+			console.log('Першу перевірку автоподачі завершено.');
 		} catch (error) {
 			console.error('Помилка першої автоподачі:', error);
 		}

@@ -1,7 +1,13 @@
 const state = require('./state');
 const { updateTransactionStatus, findTransactionAnySheet } = require('./googleSheets');
+const { logStatusChange } = require('./statusLog');
 
-const BACKFILL_DAYS = Number(process.env.TELEGRAM_BACKFILL_DAYS || 60);
+const parsedBackfillDays = Number(process.env.TELEGRAM_BACKFILL_DAYS);
+const BACKFILL_DAYS = Number.isFinite(parsedBackfillDays) && parsedBackfillDays > 0 ? parsedBackfillDays : 60;
+if (process.env.TELEGRAM_BACKFILL_DAYS && !(Number.isFinite(parsedBackfillDays) && parsedBackfillDays > 0)) {
+	console.error(`[УВАГА] TELEGRAM_BACKFILL_DAYS="${process.env.TELEGRAM_BACKFILL_DAYS}" не є коректним числом, використовую значення за замовчуванням: ${BACKFILL_DAYS} дн.`);
+}
+
 const psChatMap = new Map();
 const knownChatIds = [];
 
@@ -46,13 +52,108 @@ function isIgnoredAutoReply(text) {
 }
 
 const globalMessageCache = new Map();
+const GLOBAL_MESSAGE_CACHE_LIMIT = 5000;
 const handledMessages = new Set();
+
+function cacheMessage(msgId, tx) {
+	globalMessageCache.set(msgId, tx);
+	if (globalMessageCache.size > GLOBAL_MESSAGE_CACHE_LIMIT) {
+		const iterator = globalMessageCache.keys();
+		for (let i = 0; i < 1000; i++) globalMessageCache.delete(iterator.next().value);
+	}
+}
+
+function getOrCreateTransaction(transactionId, psNameRaw, cpayRaw, sheetName, statusRaw) {
+	const existing = state.activeTransactions.find(t => t.transactionId === transactionId);
+	if (existing) return existing;
+
+	const tx = {
+		transactionId,
+		psName: psNameRaw,
+		cpay: cpayRaw ? cpayRaw.toString().trim() : '',
+		sheetName,
+		status: statusRaw ? statusRaw.toString().trim().toLowerCase() : ''
+	};
+	state.activeTransactions.push(tx);
+	return tx;
+}
+
+async function matchTransactionInText(doc, text, candidateTxs) {
+	if (!text) return null;
+
+	for (const [, tx] of globalMessageCache.entries()) {
+		const txId = tx.transactionId;
+		const cpay = tx.cpay;
+		if ((txId && text.includes(txId)) || (cpay && text.includes(cpay))) return tx;
+	}
+
+	for (const tx of candidateTxs) {
+		const txId = tx.transactionId;
+		const cpay = tx.cpay;
+		if ((txId && text.includes(txId)) || (cpay && text.includes(cpay))) return tx;
+	}
+
+	if (state.targetSheets && state.targetSheets.length > 0) {
+		const potentialIds = extractPotentialIds(text).slice(0, 5);
+		for (const matchId of potentialIds) {
+			const found = await findTransactionAnySheet(doc, state.targetSheets, matchId);
+			if (found) {
+				return getOrCreateTransaction(
+					matchId,
+					found.row.get('ПС'),
+					found.row.get('Cpay'),
+					found.sheetName,
+					found.row.get('Статус')
+				);
+			}
+		}
+	}
+
+	return null;
+}
+
+const txLocks = new Map();
+
+function lockTransaction(transactionId, fn) {
+	const prevLock = txLocks.get(transactionId) || Promise.resolve();
+	const nextLock = prevLock.then(fn, fn);
+	txLocks.set(transactionId, nextLock.catch(() => {}));
+	return nextLock;
+}
+
+function applyStatusUpdate(doc, tx, newStatus, source) {
+	return lockTransaction(tx.transactionId, async () => {
+		const currentStatus = (tx.status || '').toString().trim().toLowerCase();
+		if (currentStatus === newStatus) return false;
+
+		tx.status = newStatus;
+		const txIndex = state.activeTransactions.findIndex(t => t.transactionId === tx.transactionId);
+		if (txIndex !== -1) state.activeTransactions[txIndex].status = newStatus;
+
+		try {
+			const ok = await updateTransactionStatus(doc, tx.sheetName, tx.transactionId, newStatus);
+			if (ok) {
+				logStatusChange(source, tx, currentStatus, newStatus);
+				return true;
+			}
+			tx.status = currentStatus;
+			if (txIndex !== -1) state.activeTransactions[txIndex].status = currentStatus;
+			return false;
+		} catch (error) {
+			tx.status = currentStatus;
+			if (txIndex !== -1) state.activeTransactions[txIndex].status = currentStatus;
+			console.error(error);
+			return false;
+		}
+	});
+}
 
 async function resolveTransactionFromReply(doc, client, chatId, replyToMsgId, candidateTxs, depth = 0) {
 	if (depth > 3) return null;
 
-	if (globalMessageCache.has(replyToMsgId)) {
-		return globalMessageCache.get(replyToMsgId);
+	const targetId = Number(replyToMsgId);
+	if (globalMessageCache.has(targetId)) {
+		return globalMessageCache.get(targetId);
 	}
 
 	try {
@@ -60,44 +161,19 @@ async function resolveTransactionFromReply(doc, client, chatId, replyToMsgId, ca
 		if (msgs && msgs.length > 0) {
 			const msg = msgs[0];
 			if (msg && msg.message) {
-				const allKnownTxs = [...candidateTxs, ...Array.from(globalMessageCache.values())];
-				for (const tx of allKnownTxs) {
-					const txId = tx.transactionId;
-					const cpay = tx.cpay;
-					if ((txId && msg.message.includes(txId)) || (cpay && msg.message.includes(cpay))) {
-						globalMessageCache.set(replyToMsgId, tx);
-						return tx;
-					}
-				}
-
-				if (state.targetSheets && state.targetSheets.length > 0) {
-					const potentialIds = extractPotentialIds(msg.message);
-					for (const matchId of potentialIds.slice(0, 2)) {
-						const found = await findTransactionAnySheet(doc, state.targetSheets, matchId);
-						if (found) {
-							const psNameRaw = found.row.get('ПС');
-							const cpayRaw = found.row.get('Cpay');
-							const statusRaw = found.row.get('Статус');
-
-							const matchedTx = {
-								transactionId: matchId,
-								psName: psNameRaw,
-								cpay: cpayRaw ? cpayRaw.toString().trim() : '',
-								sheetName: found.sheetName,
-								status: statusRaw ? statusRaw.toString().trim().toLowerCase() : ''
-							};
-							state.activeTransactions.push(matchedTx);
-							globalMessageCache.set(replyToMsgId, matchedTx);
-							return matchedTx;
-						}
-					}
+				const matchedTx = await matchTransactionInText(doc, msg.message, candidateTxs);
+				if (matchedTx) {
+					cacheMessage(targetId, matchedTx);
+					return matchedTx;
 				}
 			}
 			if (msg && msg.replyTo) {
 				return await resolveTransactionFromReply(doc, client, chatId, msg.replyTo.replyToMsgId, candidateTxs, depth + 1);
 			}
 		}
-	} catch (err) {}
+	} catch (err) {
+		console.error(err);
+	}
 	return null;
 }
 
@@ -115,44 +191,8 @@ async function processTelegramMessage(doc, client, chatId, message, ourUserIds, 
 
 	const senderId = message.senderId ? message.senderId.toString() : null;
 	const isFromUs = ourUserIds.includes(senderId);
-	let matchedTx = null;
 
-	if (message.message) {
-		for (const [, tx] of globalMessageCache.entries()) {
-			const txId = tx.transactionId;
-			const cpay = tx.cpay;
-			if ((txId && message.message.includes(txId)) || (cpay && message.message.includes(cpay))) {
-				matchedTx = tx; break;
-			}
-		}
-		if (!matchedTx) {
-			for (const tx of candidateTxs) {
-				const txId = tx.transactionId;
-				const cpay = tx.cpay;
-				if ((txId && message.message.includes(txId)) || (cpay && message.message.includes(cpay))) {
-					matchedTx = tx; break;
-				}
-			}
-		}
-
-		if (!matchedTx && state.targetSheets && state.targetSheets.length > 0) {
-			const potentialIds = extractPotentialIds(message.message);
-			for (const matchId of potentialIds.slice(0, 2)) {
-				const found = await findTransactionAnySheet(doc, state.targetSheets, matchId);
-				if (found) {
-					const psNameRaw = found.row.get('ПС');
-					const cpayRaw = found.row.get('Cpay');
-					const statusRaw = found.row.get('Статус');
-					matchedTx = {
-						transactionId: matchId, psName: psNameRaw, cpay: cpayRaw ? cpayRaw.toString().trim() : '',
-						sheetName: found.sheetName, status: statusRaw ? statusRaw.toString().trim().toLowerCase() : ''
-					};
-					state.activeTransactions.push(matchedTx);
-					break;
-				}
-			}
-		}
-	}
+	let matchedTx = message.message ? await matchTransactionInText(doc, message.message, candidateTxs) : null;
 
 	if (!matchedTx && message.replyTo) {
 		matchedTx = await resolveTransactionFromReply(doc, client, chatId, message.replyTo.replyToMsgId, candidateTxs);
@@ -160,22 +200,9 @@ async function processTelegramMessage(doc, client, chatId, message, ourUserIds, 
 
 	if (!matchedTx) return;
 
-	globalMessageCache.set(message.id, matchedTx);
+	cacheMessage(Number(message.id), matchedTx);
 	const newStatus = isFromUs ? 'in progress' : 'update';
-	const currentStatus = (matchedTx.status || '').toString().trim().toLowerCase();
-
-	if (currentStatus === newStatus) return;
-
-	matchedTx.status = newStatus;
-	const txIndex = state.activeTransactions.findIndex(tx => tx.transactionId === matchedTx.transactionId);
-	if (txIndex !== -1) state.activeTransactions[txIndex].status = newStatus;
-
-	try {
-		await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, newStatus);
-	} catch (error) {
-		matchedTx.status = currentStatus;
-		if (txIndex !== -1) state.activeTransactions[txIndex].status = currentStatus;
-	}
+	await applyStatusUpdate(doc, matchedTx, newStatus, 'Telegram, live');
 }
 
 function makeTelegramMessageHandler(doc, client, ourUserIds) {
@@ -197,28 +224,17 @@ function makeTelegramMessageHandler(doc, client, ourUserIds) {
 function makeReactionHandler(doc) {
 	return async (event) => {
 		if (event && (event.className === 'UpdateMessageReactions' || event.className === 'UpdateBotMessageReaction')) {
-			const msgId = event.msgId;
+			const msgId = event.msgId ? Number(event.msgId) : null;
 			if (!msgId) return;
 
 			const tx = globalMessageCache.get(msgId);
 			if (!tx) return;
 
 			const hasReactions = event.reactions && event.reactions.results && event.reactions.results.length > 0;
+			const newStatus = hasReactions ? 'in progress' : 'update';
+			const source = hasReactions ? 'Telegram, reaction' : 'Telegram, reaction removed';
 
-			if (hasReactions) {
-				const newStatus = 'in progress';
-				const currentStatus = (tx.status || '').toString().trim().toLowerCase();
-
-				if (currentStatus !== newStatus) {
-					tx.status = newStatus;
-					const txIndex = state.activeTransactions.findIndex(t => t.transactionId === tx.transactionId);
-					if (txIndex !== -1) state.activeTransactions[txIndex].status = newStatus;
-
-					try {
-						await updateTransactionStatus(doc, tx.sheetName, tx.transactionId, newStatus);
-					} catch (err) {}
-				}
-			}
+			await applyStatusUpdate(doc, tx, newStatus, source);
 		}
 	};
 }
@@ -250,31 +266,43 @@ async function findTransactionMessagesInChat(clients, chatId, searchTerm, cutoff
 
 			if (validBase.length === 0) continue;
 
-			const relatedMessages = new Map();
-			const chainIds = new Set();
-
-			for (const msg of validBase) {
-				relatedMessages.set(msg.id, msg);
-				chainIds.add(msg.id);
+			// Один прохід будує індекс parent -> children замість повторного O(n) сканування
+			// recentMessages на кожній ітерації while-циклу (як було раніше).
+			const childrenByParent = new Map();
+			for (const msg of recentMessages) {
+				if (msg.replyTo) {
+					const parentId = msg.replyTo.replyToMsgId;
+					if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+					childrenByParent.get(parentId).push(msg);
+				}
 			}
 
-			let addedNew = true;
-			while (addedNew) {
-				addedNew = false;
-				for (let i = recentMessages.length - 1; i >= 0; i--) {
-					const subMsg = recentMessages[i];
-					if (!relatedMessages.has(subMsg.id) && subMsg.replyTo && chainIds.has(subMsg.replyTo.replyToMsgId)) {
-						relatedMessages.set(subMsg.id, subMsg);
-						chainIds.add(subMsg.id);
-						addedNew = true;
+			const relatedMessages = new Map();
+			for (const msg of validBase) {
+				relatedMessages.set(msg.id, msg);
+			}
+
+			const queue = [...validBase];
+			while (queue.length > 0) {
+				const current = queue.shift();
+				const children = childrenByParent.get(current.id) || [];
+				for (const child of children) {
+					if (!relatedMessages.has(child.id)) {
+						relatedMessages.set(child.id, child);
+						queue.push(child);
 					}
 				}
 			}
+
 			return Array.from(relatedMessages.values());
 
 		} catch (error) {
 			lastError = error;
 		}
+	}
+
+	if (lastError) {
+		console.error(lastError.message);
 	}
 	return [];
 }
@@ -284,6 +312,11 @@ async function applyFinalStatusFromMessages(doc, tx, messages, ourUserIds) {
 	if (validMessages.length === 0) return false;
 
 	const sorted = [...validMessages].sort((a, b) => (a.date || 0) - (b.date || 0));
+
+	sorted.forEach(m => {
+		if (m.id) cacheMessage(Number(m.id), tx);
+	});
+
 	const lastMessage = sorted[sorted.length - 1];
 
 	const senderId = lastMessage.senderId ? lastMessage.senderId.toString() : null;
@@ -293,25 +326,7 @@ async function applyFinalStatusFromMessages(doc, tx, messages, ourUserIds) {
 
 	const newStatus = (isFromUs || hasReaction) ? 'in progress' : 'update';
 
-	const currentStatus = (tx.status || '').toString().trim().toLowerCase();
-
-	if (currentStatus === newStatus) return false;
-
-	try {
-		const ok = await updateTransactionStatus(doc, tx.sheetName, tx.transactionId, newStatus);
-		if (!ok) return false;
-
-		if (currentStatus !== newStatus) {
-			tx.status = newStatus;
-			const txIndex = state.activeTransactions.findIndex(t => t.transactionId === tx.transactionId);
-			if (txIndex !== -1) state.activeTransactions[txIndex].status = newStatus;
-		}
-
-		globalMessageCache.set(lastMessage.id, tx);
-		return true;
-	} catch (error) {
-		return false;
-	}
+	return applyStatusUpdate(doc, tx, newStatus, 'Telegram, бекфіл');
 }
 
 async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = false) {
@@ -390,6 +405,7 @@ async function setupTelegram(mainDoc, telegramClients, ourUserIds) {
 		client.addEventHandler(makeTelegramMessageHandler(mainDoc, client, ourUserIds), new NewMessage({}));
 		client.addEventHandler(makeReactionHandler(mainDoc), new Raw({}));
 	}
+	console.log(`Telegram: підключено ${telegramClients.length} клієнт(и), слухаємо чатів: ${knownChatIds.length}`);
 }
 
 module.exports = { setupTelegram, runTelegramBackfill, psChatMap };

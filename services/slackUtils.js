@@ -1,8 +1,8 @@
 const state = require('./state');
-const { updateTransactionStatus, findTransactionAnySheet, initGoogleSheets } = require('./googleSheets');
+const { updateTransactionStatus, findTransactionAnySheet } = require('./googleSheets');
 const { logStatusChange } = require('./statusLog');
 
-async function resolveTransactionById(transactionId) {
+async function resolveTransactionById(doc, transactionId) {
 	if (!transactionId) return null;
 
 	let matchedTx = state.activeTransactions.find(tx =>
@@ -12,7 +12,6 @@ async function resolveTransactionById(transactionId) {
 
 	if (!state.targetSheets || state.targetSheets.length === 0) return null;
 
-	const doc = await initGoogleSheets();
 	const found = await findTransactionAnySheet(doc, state.targetSheets, transactionId);
 	if (!found) return null;
 
@@ -32,7 +31,7 @@ async function resolveTransactionById(transactionId) {
 	return matchedTx;
 }
 
-async function applyStatusFromMatch(source, matchedTx, newStatus) {
+async function applyStatusFromMatch(doc, source, matchedTx, newStatus) {
 	if (!matchedTx) return;
 
 	const currentStatus = (matchedTx.status || '').toString().trim().toLowerCase();
@@ -43,8 +42,6 @@ async function applyStatusFromMatch(source, matchedTx, newStatus) {
 	const previousStatus = matchedTx.status;
 	matchedTx.status = targetStatus;
 	matchedTx.lastStatusChange = Date.now();
-
-	const doc = await initGoogleSheets();
 
 	try {
 		const ok = await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, targetStatus);

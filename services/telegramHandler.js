@@ -1,3 +1,4 @@
+const { Api } = require('telegram');
 const state = require('./state');
 const { updateTransactionStatus, findTransactionAnySheet } = require('./googleSheets');
 const { logStatusChange } = require('./statusLog');
@@ -10,25 +11,226 @@ if (process.env.TELEGRAM_BACKFILL_DAYS && !(Number.isFinite(parsedBackfillDays) 
 
 const psChatMap = new Map();
 const knownChatIds = [];
+const globalSearchThrottle = new Map();
+let lastWarmupTime = 0;
 
-const matches = [...(process.env.KNOWN_CHAT_IDS || '').matchAll(/(-?\d+)\s*\(([^)]+)\)/g)];
+async function getPsSheetData(doc) {
+	const sheetName = 'ПС-чати';
+	let sheet = doc.sheetsByTitle[sheetName];
 
-for (const match of matches) {
-	const chatId = Number(match[1]);
-	const psNames = match[2].split(',').map(s => s.trim().toLowerCase());
-
-	if (!knownChatIds.includes(chatId)) {
-		knownChatIds.push(chatId);
+	if (!sheet) {
+		sheet = await doc.addSheet({ title: sheetName, headerValues: ['Назва чату', 'ID чату', 'Col3', 'Незнайдені чати'] });
+	} else {
+		await sheet.loadHeaderRow();
+		let headers = [...sheet.headerValues];
+		let changed = false;
+		while (headers.length < 4) { headers.push(''); changed = true; }
+		if (headers[3] !== 'Незнайдені чати') { headers[3] = 'Незнайдені чати'; changed = true; }
+		headers = headers.map((h, i) => h === '' ? `Col${i+1}` : h);
+		if (changed) {
+			try { await sheet.setHeaderRow(headers); } catch(e){}
+		}
 	}
 
-	for (const psName of psNames) {
-		if (!psChatMap.has(psName)) {
-			psChatMap.set(psName, []);
-		}
-		if (!psChatMap.get(psName).includes(chatId)) {
-			psChatMap.get(psName).push(chatId);
+	const rows = await sheet.getRows();
+	const knownList = [];
+	const unfoundSet = new Set();
+
+	for (const row of rows) {
+		const name = (row.get('Назва чату') || '').toString().trim();
+		const id = (row.get('ID чату') || '').toString().trim();
+		const unfound = (row.get('Незнайдені чати') || '').toString().trim();
+
+		if (name && id) knownList.push({ name, id });
+		if (unfound) unfoundSet.add(unfound);
+	}
+	return { sheet, knownList, unfoundSet };
+}
+
+async function writePsSheetDataFast(sheet, knownList, unfoundSet) {
+	knownList.sort((a, b) => a.name.localeCompare(b.name, 'uk'));
+	const unfoundList = Array.from(unfoundSet).sort((a, b) => a.localeCompare(b, 'uk'));
+
+	const maxLen = Math.max(knownList.length, unfoundList.length);
+	const totalRowsToLoad = Math.max(maxLen + 2, sheet.rowCount);
+
+	if (sheet.rowCount < maxLen + 2) {
+		await sheet.resize({ rowCount: maxLen + 10, columnCount: sheet.columnCount });
+	}
+
+	await sheet.loadCells(`A2:D${totalRowsToLoad}`);
+	let needsSave = false;
+
+	for (let i = 0; i < totalRowsToLoad - 1; i++) {
+		const expectedName = i < knownList.length ? knownList[i].name : '';
+		const expectedId = i < knownList.length ? knownList[i].id : '';
+		const expectedUnfound = i < unfoundList.length ? unfoundList[i] : '';
+
+		const cellA = sheet.getCell(i + 1, 0);
+		const cellB = sheet.getCell(i + 1, 1);
+		const cellD = sheet.getCell(i + 1, 3);
+
+		if (cellA.value !== expectedName) { cellA.value = expectedName; needsSave = true; }
+		if (cellB.value !== expectedId) { cellB.value = expectedId; needsSave = true; }
+		if (cellD.value !== expectedUnfound) { cellD.value = expectedUnfound; needsSave = true; }
+	}
+
+	if (needsSave) {
+		await sheet.saveUpdatedCells();
+	}
+}
+
+async function syncPsChats(doc) {
+	const { sheet, knownList, unfoundSet } = await getPsSheetData(doc);
+	let hasChanges = false;
+
+	psChatMap.clear();
+	knownChatIds.length = 0;
+
+	for (const item of knownList) {
+		const cIdNum = Number(item.id);
+		const norm = item.name.toLowerCase();
+		if (!knownChatIds.includes(cIdNum)) knownChatIds.push(cIdNum);
+		if (!psChatMap.has(norm)) psChatMap.set(norm, []);
+		if (!psChatMap.get(norm).includes(cIdNum)) psChatMap.get(norm).push(cIdNum);
+	}
+
+	const unfoundArr = Array.from(unfoundSet);
+	for (const u of unfoundArr) {
+		if (psChatMap.has(u.toLowerCase())) {
+			unfoundSet.delete(u);
+			hasChanges = true;
 		}
 	}
+
+	if (hasChanges) {
+		try {
+			await writePsSheetDataFast(sheet, knownList, unfoundSet);
+		} catch (err) {
+			console.error('[УВАГА] Не вдалося оновити аркуш "ПС-чати":', err.message);
+		}
+	}
+}
+
+async function addPsChatToSheet(doc, psNameRaw, chatId) {
+	const { sheet, knownList, unfoundSet } = await getPsSheetData(doc);
+	const norm = psNameRaw.toLowerCase();
+
+	if (knownList.find(k => k.name.toLowerCase() === norm)) return;
+
+	knownList.push({ name: psNameRaw, id: chatId.toString() });
+
+	const unfoundArr = Array.from(unfoundSet);
+	for (const u of unfoundArr) {
+		if (u.toLowerCase() === norm) {
+			unfoundSet.delete(u);
+		}
+	}
+
+	try {
+		await writePsSheetDataFast(sheet, knownList, unfoundSet);
+	} catch (err) {
+		console.error(`[УВАГА] Помилка запису нового ПС "${psNameRaw}" в аркуш:`, err.message);
+	}
+
+	const cNum = Number(chatId);
+	if (!knownChatIds.includes(cNum)) knownChatIds.push(cNum);
+	if (!psChatMap.has(norm)) psChatMap.set(norm, []);
+	if (!psChatMap.get(norm).includes(cNum)) psChatMap.get(norm).push(cNum);
+}
+
+async function flushUnfoundPsToSheet(doc, newUnfoundPsNamesSet) {
+	if (newUnfoundPsNamesSet.size === 0) return;
+
+	const { sheet, knownList, unfoundSet } = await getPsSheetData(doc);
+	let hasChanges = false;
+
+	for (const psNameRaw of newUnfoundPsNamesSet) {
+		const norm = psNameRaw.toLowerCase();
+		if (!psChatMap.has(norm)) {
+			const already = Array.from(unfoundSet).some(u => u.toLowerCase() === norm);
+			if (!already) {
+				unfoundSet.add(psNameRaw);
+				hasChanges = true;
+			}
+		}
+	}
+
+	if (hasChanges) {
+		try {
+			await writePsSheetDataFast(sheet, knownList, unfoundSet);
+		} catch (err) {
+			console.error('[УВАГА] Помилка запису незнайдених ПС:', err.message);
+		}
+	}
+}
+
+const clientChatAccess = new Map();
+
+async function warmupTelegramClients(clients) {
+	for (let i = 0; i < clients.length; i++) {
+		const client = clients[i];
+		try {
+			const dialogs = await client.getDialogs();
+			if (!clientChatAccess.has(client)) {
+				clientChatAccess.set(client, new Set());
+			}
+			const accessSet = clientChatAccess.get(client);
+			dialogs.forEach(d => accessSet.add(d.id.toString()));
+		} catch (err) {
+			console.error(`Помилка прогріву діалогів клієнта ${i + 1}:`, err.message);
+		}
+	}
+}
+
+function pickClientsForChat(clients, chatId) {
+	const targetId = chatId.toString();
+	const withAccess = clients.filter(c => {
+		const ids = clientChatAccess.get(c);
+		return ids && ids.has(targetId);
+	});
+	return withAccess.length > 0 ? withAccess : clients;
+}
+
+async function findChatIdForTransactionGlobal(clients, searchTerm) {
+	for (const client of clients) {
+		try {
+			const result = await client.invoke(new Api.messages.SearchGlobal({
+				q: searchTerm.toString().trim(),
+				limit: 1,
+				offsetRate: 0,
+				offsetId: 0,
+				offsetPeer: new Api.InputPeerEmpty()
+			}));
+
+			if (result && result.messages && result.messages.length > 0) {
+				const msg = result.messages[0];
+				if (msg.peerId) {
+					let foundId = null;
+					if (msg.peerId.className === 'PeerChannel') {
+						foundId = '-100' + msg.peerId.channelId.toString();
+					} else if (msg.peerId.className === 'PeerChat') {
+						foundId = '-' + msg.peerId.chatId.toString();
+					} else if (msg.peerId.className === 'PeerUser') {
+						foundId = msg.peerId.userId.toString();
+					}
+
+					if (foundId) {
+						if (!clientChatAccess.has(client)) {
+							clientChatAccess.set(client, new Set());
+						}
+						clientChatAccess.get(client).add(foundId);
+						return foundId;
+					}
+				}
+			}
+		} catch (err) {
+			if (err.message && err.message.toLowerCase().includes('flood')) {
+				console.error(`[Помилка Telegram] FloodWait при глобальному пошуку: ${err.message}`);
+			}
+		}
+	}
+	return null;
 }
 
 function getPsNameForChat(chatId) {
@@ -54,6 +256,7 @@ function isIgnoredAutoReply(text) {
 const globalMessageCache = new Map();
 const GLOBAL_MESSAGE_CACHE_LIMIT = 5000;
 const handledMessages = new Set();
+const txLocks = new Map();
 
 function cacheMessage(msgId, tx) {
 	globalMessageCache.set(msgId, tx);
@@ -76,6 +279,40 @@ function getOrCreateTransaction(transactionId, psNameRaw, cpayRaw, sheetName, st
 	};
 	state.activeTransactions.push(tx);
 	return tx;
+}
+
+function lockTransaction(transactionId, fn) {
+	const prevLock = txLocks.get(transactionId) || Promise.resolve();
+	const nextLock = prevLock.then(fn, fn);
+	txLocks.set(transactionId, nextLock.catch(() => {}));
+	return nextLock;
+}
+
+function applyStatusUpdate(doc, tx, newStatus, source) {
+	return lockTransaction(tx.transactionId, async () => {
+		const currentStatus = (tx.status || '').toString().trim().toLowerCase();
+		if (currentStatus === newStatus) return false;
+
+		tx.status = newStatus;
+		const txIndex = state.activeTransactions.findIndex(t => t.transactionId === tx.transactionId);
+		if (txIndex !== -1) state.activeTransactions[txIndex].status = newStatus;
+
+		try {
+			const ok = await updateTransactionStatus(doc, tx.sheetName, tx.transactionId, newStatus);
+			if (ok) {
+				logStatusChange(source, tx, currentStatus, newStatus);
+				return true;
+			}
+			tx.status = currentStatus;
+			if (txIndex !== -1) state.activeTransactions[txIndex].status = currentStatus;
+			return false;
+		} catch (error) {
+			tx.status = currentStatus;
+			if (txIndex !== -1) state.activeTransactions[txIndex].status = currentStatus;
+			console.error(`[Помилка оновлення Google Таблиці] Транзакція: ${tx.transactionId} -> ${error.message}`);
+			return false;
+		}
+	});
 }
 
 async function matchTransactionInText(doc, text, candidateTxs) {
@@ -112,42 +349,6 @@ async function matchTransactionInText(doc, text, candidateTxs) {
 	return null;
 }
 
-const txLocks = new Map();
-
-function lockTransaction(transactionId, fn) {
-	const prevLock = txLocks.get(transactionId) || Promise.resolve();
-	const nextLock = prevLock.then(fn, fn);
-	txLocks.set(transactionId, nextLock.catch(() => {}));
-	return nextLock;
-}
-
-function applyStatusUpdate(doc, tx, newStatus, source) {
-	return lockTransaction(tx.transactionId, async () => {
-		const currentStatus = (tx.status || '').toString().trim().toLowerCase();
-		if (currentStatus === newStatus) return false;
-
-		tx.status = newStatus;
-		const txIndex = state.activeTransactions.findIndex(t => t.transactionId === tx.transactionId);
-		if (txIndex !== -1) state.activeTransactions[txIndex].status = newStatus;
-
-		try {
-			const ok = await updateTransactionStatus(doc, tx.sheetName, tx.transactionId, newStatus);
-			if (ok) {
-				logStatusChange(source, tx, currentStatus, newStatus);
-				return true;
-			}
-			tx.status = currentStatus;
-			if (txIndex !== -1) state.activeTransactions[txIndex].status = currentStatus;
-			return false;
-		} catch (error) {
-			tx.status = currentStatus;
-			if (txIndex !== -1) state.activeTransactions[txIndex].status = currentStatus;
-			console.error(error);
-			return false;
-		}
-	});
-}
-
 async function resolveTransactionFromReply(doc, client, chatId, replyToMsgId, candidateTxs, depth = 0) {
 	if (depth > 3) return null;
 
@@ -172,7 +373,7 @@ async function resolveTransactionFromReply(doc, client, chatId, replyToMsgId, ca
 			}
 		}
 	} catch (err) {
-		console.error(err);
+		console.error(`[Помилка Telegram] Пошук reply-транзакції у чаті ${chatId}: ${err.message}`);
 	}
 	return null;
 }
@@ -212,7 +413,7 @@ function makeTelegramMessageHandler(doc, client, ourUserIds) {
 		const chatId = Number(message.chatId);
 		if (!knownChatIds.includes(chatId)) return;
 
-		const chatPsName = getPsNameForChat(chatId);
+		const chatPsName = Array.from(psChatMap.entries()).find(([, ids]) => ids.includes(chatId))?.[0];
 		const candidateTxs = chatPsName
 			? state.activeTransactions.filter(tx => (tx.psName || '').toString().trim().toLowerCase() === chatPsName)
 			: state.activeTransactions;
@@ -239,34 +440,11 @@ function makeReactionHandler(doc) {
 	};
 }
 
-const clientChatAccess = new Map(); // client -> Set<string> доступних chatId
-
-async function warmupTelegramClients(clients) {
-	for (const client of clients) {
-		try {
-			const dialogs = await client.getDialogs();
-			clientChatAccess.set(client, new Set(dialogs.map(d => d.id.toString())));
-		} catch (err) {
-			console.error('Помилка прогріву діалогів клієнта:', err.message);
-		}
-	}
-}
-
-function pickClientsForChat(clients, chatId) {
-	const targetId = chatId.toString();
-	const withAccess = clients.filter(c => {
-		const ids = clientChatAccess.get(c);
-		return ids && ids.has(targetId);
-	});
-
-	return withAccess.length > 0 ? withAccess : clients;
-}
-
 const chatRecentCache = new Map();
 
-async function findTransactionMessagesInChat(clients, chatId, searchTerm, cutoffTimestamp) {
-	let lastError = null;
+async function findTransactionMessagesInChat(clients, chatId, searchTerm, cutoffTimestamp, tx) {
 	const candidateClients = pickClientsForChat(clients, chatId);
+	let errors = [];
 
 	for (const client of candidateClients) {
 		try {
@@ -319,12 +497,14 @@ async function findTransactionMessagesInChat(clients, chatId, searchTerm, cutoff
 			return Array.from(relatedMessages.values());
 
 		} catch (error) {
-			lastError = error;
+			errors.push(error.message);
 		}
 	}
 
-	if (lastError) {
-		console.error(lastError.message);
+	if (errors.length > 0) {
+		const txName = tx ? (tx.transactionId || tx.cpay || 'Невідомо') : searchTerm;
+		const uniqueErrors = Array.from(new Set(errors)).join(' | ');
+		console.error(`\n[Помилка Telegram] Транзакція: ${txName} (Чат: ${chatId}) -> ${uniqueErrors}`);
 	}
 	return [];
 }
@@ -352,7 +532,13 @@ async function applyFinalStatusFromMessages(doc, tx, messages, ourUserIds) {
 }
 
 async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = false) {
-	const cutoffTimestamp = Math.floor(Date.now() / 1000) - BACKFILL_DAYS * 24 * 60 * 60;
+	const now = Date.now();
+	if (now - lastWarmupTime > 3600000) {
+		await warmupTelegramClients(clients);
+		lastWarmupTime = now;
+	}
+
+	const cutoffTimestamp = Math.floor(now / 1000) - BACKFILL_DAYS * 24 * 60 * 60;
 	const slackPsList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
 	const slackTicketPsList = process.env.SLACK_TICKET_PS ? process.env.SLACK_TICKET_PS.split(',').map(s => s.trim().toLowerCase()) : [];
 	const externalPsNames = process.env.EXTERNAL_PS_NAMES ? process.env.EXTERNAL_PS_NAMES.split(',').map(s => s.trim().toLowerCase()) : [];
@@ -367,18 +553,46 @@ async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = fals
 	let skippedNoChat = 0;
 	const unmonitoredPsNames = new Set();
 
+	const totalCount = state.activeTransactions.length;
+
 	if (isInitialRun) {
-		console.log(`Бекфіл Telegram: перевіряю ${state.activeTransactions.length} транзакцій по відповідних чатах ПС (за ${BACKFILL_DAYS} дн.)...`);
+		console.log(`Бекфіл Telegram: перевіряю ${totalCount} транзакцій по відповідних чатах ПС (за ${BACKFILL_DAYS} дн.)...`);
 	}
 
+	let processedCount = 0;
+
 	for (const tx of state.activeTransactions) {
-		const psName = (tx.psName || '').toString().trim().toLowerCase();
-		const chatIds = psChatMap.get(psName);
+		processedCount++;
+
+		if (!tx.chatName || tx.chatName.toString().trim() === '') {
+			continue;
+		}
+
+		process.stdout.write(`\x1b[2K\rБекфіл Telegram: перевірка ${processedCount}/${totalCount}`);
+
+		const psNameRaw = (tx.psName || '').toString().trim();
+		const psName = psNameRaw.toLowerCase();
+		let chatIds = psChatMap.get(psName);
+
+		if (!chatIds || chatIds.length === 0) {
+			const lastSearch = globalSearchThrottle.get(psName) || 0;
+			if (now - lastSearch > 3600000) {
+				const searchTerm = tx.transactionId || tx.cpay;
+				if (searchTerm && searchTerm.length > 4) {
+					globalSearchThrottle.set(psName, now);
+					const foundChatId = await findChatIdForTransactionGlobal(clients, searchTerm);
+					if (foundChatId) {
+						await addPsChatToSheet(doc, psNameRaw, foundChatId);
+						chatIds = psChatMap.get(psName);
+					}
+				}
+			}
+		}
 
 		if (!chatIds || chatIds.length === 0) {
 			skippedNoChat++;
-			if (psName && !slackPsList.includes(psName) && !slackTicketPsList.includes(psName) && !externalPsNames.includes(psName)) {
-				unmonitoredPsNames.add(psName);
+			if (psNameRaw && !slackPsList.includes(psName) && !slackTicketPsList.includes(psName) && !externalPsNames.includes(psName)) {
+				unmonitoredPsNames.add(psNameRaw);
 			}
 			continue;
 		}
@@ -391,7 +605,7 @@ async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = fals
 
 		const allMessages = [];
 		for (const chatId of chatIds) {
-			const messages = await findTransactionMessagesInChat(clients, chatId, searchTerm, cutoffTimestamp);
+			const messages = await findTransactionMessagesInChat(clients, chatId, searchTerm, cutoffTimestamp, tx);
 			allMessages.push(...messages);
 		}
 
@@ -402,10 +616,14 @@ async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = fals
 		if (changed) updatedCount++;
 	}
 
+	process.stdout.write('\x1b[2K\r');
+
 	const remainingActiveCount = state.activeTransactions.filter(tx => {
 		const status = (tx.status || '').toString().trim().toLowerCase();
 		return status === '' || status === 'in progress';
 	}).length;
+
+	await flushUnfoundPsToSheet(doc, unmonitoredPsNames);
 
 	if (isInitialRun) {
 		console.log(`Бекфіл Telegram завершено.`);
@@ -415,7 +633,7 @@ async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = fals
 		console.log(`  Опрацьовано повідомлень: ${totalMatched}. Транзакцій без чату: ${skippedNoChat}`);
 
 		if (unmonitoredPsNames.size > 0) {
-			console.log(`  [УВАГА] Не стежимо за цими ПС: ${Array.from(unmonitoredPsNames).join(', ')}`);
+			console.log(`\n[УВАГА] Не стежимо за цими ПС: ${Array.from(unmonitoredPsNames).join(', ')}`);
 		}
 	}
 }
@@ -423,8 +641,11 @@ async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = fals
 async function setupTelegram(mainDoc, telegramClients, ourUserIds) {
 	const { NewMessage, Raw } = require('telegram/events');
 
+	await syncPsChats(mainDoc);
+	lastWarmupTime = Date.now();
 	await warmupTelegramClients(telegramClients);
 	await runTelegramBackfill(mainDoc, telegramClients, ourUserIds, true);
+
 	for (const client of telegramClients) {
 		client.addEventHandler(makeTelegramMessageHandler(mainDoc, client, ourUserIds), new NewMessage({}));
 		client.addEventHandler(makeReactionHandler(mainDoc), new Raw({}));

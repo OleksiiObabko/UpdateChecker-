@@ -25,7 +25,7 @@ console.error = function (...args) {
 };
 
 // const ALL_SHEETS = ['Кити', 'Омнік', 'Лелеки', 'Фікси', 'Дракони', 'Корівки', 'Вулик'];
-const ALL_SHEETS = ['Корівки', 'Вулик'];
+const ALL_SHEETS = ['Кити', 'Лелеки', 'Фікси', 'Корівки', 'Вулик'];
 
 async function promptSheetSelection() {
 	const response = await prompts({
@@ -34,7 +34,6 @@ async function promptSheetSelection() {
 		message: 'Оберіть аркуш для моніторингу:',
 		choices: [
 			{ title: 'Усі аркуші', value: 'ALL' },
-			{ title: 'Test sheet', value: 'Test sheet' },
 			{ title: 'Кити', value: 'Кити' },
 			{ title: 'Омнік', value: 'Омнік' },
 			{ title: 'Лелеки', value: 'Лелеки' },

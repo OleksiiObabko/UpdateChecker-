@@ -60,7 +60,7 @@ function createSlackApp(doc) {
 				await handleTicketSlackMessage(doc, message, matchedTx, isReply, ourUserId);
 			}
 		} catch (error) {
-			process.stdout.write(`\x1b[2K\rПомилка обробки Slack-повідомлення: ${error.message}\n`);
+			process.stdout.write(`\n\x1b[2K\rПомилка обробки Slack-повідомлення: ${error.message}\n`);
 		}
 	});
 
@@ -118,7 +118,6 @@ function createSlackApp(doc) {
 }
 
 async function runSlackBackfill(doc, client) {
-	process.stdout.write(`\x1b[2K\rБекфіл Slack: розпочато...\n`);
 	const standardList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
 	const ticketList = process.env.SLACK_TICKET_PS ? process.env.SLACK_TICKET_PS.split(',').map(s => s.trim().toLowerCase()) : [];
 	const allSlackPs = [...standardList, ...ticketList];
@@ -133,7 +132,14 @@ async function runSlackBackfill(doc, client) {
 
 	if (targetTxs.length === 0) return;
 
+	process.stdout.write(`\x1b[2K\rБекфіл Slack: розпочато для ${targetTxs.length} транзакцій...\n`);
+
+	let processedCount = 0;
+
 	for (const tx of targetTxs) {
+		processedCount++;
+		process.stdout.write(`\x1b[2K\rБекфіл Slack: перевірка ${processedCount}/${targetTxs.length} (Транзакція: ${tx.transactionId})`);
+
 		try {
 			const searchRes = await client.search.messages({
 				query: `"${tx.transactionId}"`,
@@ -173,13 +179,13 @@ async function runSlackBackfill(doc, client) {
 				}
 			}
 		} catch (err) {
-			process.stdout.write(`\x1b[2K\rПомилка бекфілу Slack для ${tx.transactionId}: ${err.message}\n`);
+			process.stdout.write(`\n\x1b[2K\rПомилка бекфілу Slack для ${tx.transactionId}: ${err.message}\n`);
 		}
 
 		await new Promise(resolve => setTimeout(resolve, 4500));
 	}
 
-	process.stdout.write(`\x1b[2K\rБекфіл Slack: успішно завершено.\n`);
+	process.stdout.write(`\n\x1b[2K\rБекфіл Slack: успішно завершено.\n`);
 }
 
 module.exports = { createSlackApp, runSlackBackfill };

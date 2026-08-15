@@ -41,13 +41,7 @@ OUR_SLACK_USER_ID=ідентифікатор_акаунту_в_slack
 
 SLACK_PS="name_ps_in_slack"
 
-EXTERNAL_PS_SHEET_ID=ідентифікатор_таблиці_пс
 EXTERNAL_PS_NAMES=назви_пс_як_у_твоїй_таблиці
-
-KNOWN_CHAT_IDS="
--chatid1 (pgi:ps1)
--chatid2 (pgi:ps2)
-"
 ```
 ## Запуск програми
 ```

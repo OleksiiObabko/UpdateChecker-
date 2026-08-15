@@ -14,6 +14,21 @@ function getPsType(psNameRaw) {
 	return null;
 }
 
+function extractPotentialIds(text) {
+	if (!text) return [];
+	const extracted = text.match(/\b(?=[a-zA-Z0-9_-]*\d)[a-zA-Z0-9_-]{3,}\b/g);
+	return extracted ? Array.from(new Set(extracted)) : [];
+}
+
+async function findMatchedTx(doc, text) {
+	const candidates = extractPotentialIds(text).slice(0, 5);
+	for (const candidateId of candidates) {
+		const matchedTx = await resolveTransactionById(doc, candidateId);
+		if (matchedTx) return matchedTx;
+	}
+	return null;
+}
+
 function createSlackApp(doc) {
 	const slackApp = new App({
 		token: process.env.SLACK_BOT_TOKEN,
@@ -42,11 +57,7 @@ function createSlackApp(doc) {
 				parentText = message.text;
 			}
 
-			const match = parentText.match(/\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}|\d+)\b/);
-			if (!match) return;
-
-			const transactionId = match[1];
-			const matchedTx = await resolveTransactionById(doc, transactionId);
+			const matchedTx = await findMatchedTx(doc, parentText);
 			if (!matchedTx) return;
 
 			const psType = getPsType(matchedTx.psName);
@@ -64,7 +75,7 @@ function createSlackApp(doc) {
 		}
 	});
 
-	slackApp.event('reaction_added', async ({ event, client }) => {
+	async function handleReaction({ event, client, type }) {
 		try {
 			if (event.item.type !== 'message') return;
 
@@ -102,17 +113,20 @@ function createSlackApp(doc) {
 
 			if (!parentText) return;
 
-			const match = parentText.match(/\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}|\d+)\b/);
-			if (!match) return;
-
-			const transactionId = match[1];
-			const matchedTx = await resolveTransactionById(doc, transactionId);
+			const matchedTx = await findMatchedTx(doc, parentText);
 			if (!matchedTx) return;
 
-			await applyStatusFromMatch(doc, 'Slack, reaction', matchedTx, 'in progress');
+			// Симетрична реакція
+			const newStatus = type === 'added' ? 'in progress' : 'update';
+			const source = type === 'added' ? 'Slack, reaction' : 'Slack, reaction removed';
+
+			await applyStatusFromMatch(doc, source, matchedTx, newStatus);
 		} catch (error) {
 		}
-	});
+	}
+
+	slackApp.event('reaction_added', async (args) => handleReaction({ ...args, type: 'added' }));
+	slackApp.event('reaction_removed', async (args) => handleReaction({ ...args, type: 'removed' }));
 
 	return slackApp;
 }

@@ -166,12 +166,14 @@ async function flushUnfoundPsToSheet(doc, newUnfoundPsNamesSet) {
 }
 
 const clientChatAccess = new Map();
+const clientDialogsCache = new Map();
 
 async function warmupTelegramClients(clients) {
 	for (let i = 0; i < clients.length; i++) {
 		const client = clients[i];
 		try {
 			const dialogs = await client.getDialogs();
+			clientDialogsCache.set(client, dialogs); // Зберігаємо повні об'єкти діалогів для merchantChats
 			if (!clientChatAccess.has(client)) {
 				clientChatAccess.set(client, new Set());
 			}
@@ -181,6 +183,10 @@ async function warmupTelegramClients(clients) {
 			console.error(`Помилка прогріву діалогів клієнта ${i + 1}:`, err.message);
 		}
 	}
+}
+
+function getCachedDialogs(client) {
+	return clientDialogsCache.get(client) || [];
 }
 
 function pickClientsForChat(clients, chatId) {
@@ -256,7 +262,6 @@ function isIgnoredAutoReply(text) {
 const globalMessageCache = new Map();
 const GLOBAL_MESSAGE_CACHE_LIMIT = 5000;
 const handledMessages = new Set();
-const txLocks = new Map();
 
 function cacheMessage(msgId, tx) {
 	globalMessageCache.set(msgId, tx);
@@ -281,15 +286,8 @@ function getOrCreateTransaction(transactionId, psNameRaw, cpayRaw, sheetName, st
 	return tx;
 }
 
-function lockTransaction(transactionId, fn) {
-	const prevLock = txLocks.get(transactionId) || Promise.resolve();
-	const nextLock = prevLock.then(fn, fn);
-	txLocks.set(transactionId, nextLock.catch(() => {}));
-	return nextLock;
-}
-
 function applyStatusUpdate(doc, tx, newStatus, source) {
-	return lockTransaction(tx.transactionId, async () => {
+	return state.runWithLock(tx.transactionId, async () => {
 		const currentStatus = (tx.status || '').toString().trim().toLowerCase();
 		if (currentStatus === newStatus) return false;
 
@@ -568,7 +566,8 @@ async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = fals
 			continue;
 		}
 
-		process.stdout.write(`\x1b[2K\rБекфіл Telegram: перевірка ${processedCount}/${totalCount}`);
+		const txName = tx.transactionId || tx.cpay || 'Невідомо';
+		process.stdout.write(`\x1b[2K\rБекфіл Telegram: перевірка ${processedCount}/${totalCount} (Транзакція: ${txName})`);
 
 		const psNameRaw = (tx.psName || '').toString().trim();
 		const psName = psNameRaw.toLowerCase();
@@ -653,4 +652,4 @@ async function setupTelegram(mainDoc, telegramClients, ourUserIds) {
 	console.log(`Telegram: підключено ${telegramClients.length} клієнт(и), слухаємо чатів: ${knownChatIds.length}`);
 }
 
-module.exports = { setupTelegram, runTelegramBackfill, psChatMap, pickClientsForChat };
+module.exports = { setupTelegram, runTelegramBackfill, psChatMap, pickClientsForChat, getCachedDialogs };

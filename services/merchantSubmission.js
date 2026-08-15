@@ -36,7 +36,9 @@ async function findMerchantMessage(clients, chatId, merchantId) {
 
 				return { message: match, media: mediaGroup, sourceClient: client };
 			}
-		} catch (err) {}
+		} catch (err) {
+			console.error(`[MerchantSubmission] Помилка пошуку повідомлення для ${merchantId} у чаті ${chatId}: ${err.message}`);
+		}
 	}
 	return null;
 }
@@ -117,6 +119,7 @@ async function submitToPs(client, psChatId, captionText, mediaGroup) {
 
 		return true;
 	} catch (error) {
+		console.error(`[MerchantSubmission] Помилка відправки в ПС чат ${psChatId}: ${error.message}`);
 		return false;
 	}
 }
@@ -209,9 +212,11 @@ async function runMerchantSubmissionCycle(mainDoc, clients) {
 			}
 
 		} catch (error) {
-			if (error.message.includes('Мерчант-чати')) {
+			if (error.message && error.message.includes('Мерчант-чати')) {
+				console.error(`[MerchantSubmission] Відсутній аркуш: ${error.message}`);
 				return;
 			}
+			console.error(`[MerchantSubmission] Неочікувана помилка обробки транзакції ${baseTx.transactionId}: ${error.message}`);
 		}
 	}
 }

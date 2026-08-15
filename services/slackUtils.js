@@ -34,24 +34,31 @@ async function resolveTransactionById(doc, transactionId) {
 async function applyStatusFromMatch(doc, source, matchedTx, newStatus) {
 	if (!matchedTx) return;
 
-	const currentStatus = (matchedTx.status || '').toString().trim().toLowerCase();
-	const targetStatus = newStatus.toString().trim().toLowerCase();
+	return state.runWithLock(matchedTx.transactionId, async () => {
+		const currentStatus = (matchedTx.status || '').toString().trim().toLowerCase();
+		const targetStatus = newStatus.toString().trim().toLowerCase();
 
-	if (currentStatus === targetStatus) return;
+		if (currentStatus === targetStatus) return false;
 
-	const previousStatus = matchedTx.status;
-	matchedTx.status = targetStatus;
-	matchedTx.lastStatusChange = Date.now();
+		const previousStatus = matchedTx.status;
+		matchedTx.status = targetStatus;
+		matchedTx.lastStatusChange = Date.now();
 
-	try {
-		const ok = await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, targetStatus);
-		if (ok) {
-			logStatusChange(source, matchedTx, previousStatus, targetStatus);
-			if (state.stats) state.stats.updatesProvided++;
+		try {
+			const ok = await updateTransactionStatus(doc, matchedTx.sheetName, matchedTx.transactionId, targetStatus);
+			if (ok) {
+				logStatusChange(source, matchedTx, previousStatus, targetStatus);
+				if (state.stats) state.stats.updatesProvided++;
+				return true;
+			}
+			matchedTx.status = previousStatus;
+			return false;
+		} catch (error) {
+			matchedTx.status = previousStatus;
+			process.stdout.write(`\x1b[2K\rПомилка оновлення Google Таблиці для ${matchedTx.transactionId}: ${error.message}\n`);
+			return false;
 		}
-	} catch (error) {
-		process.stdout.write(`\x1b[2K\rПомилка оновлення Google Таблиці для ${matchedTx.transactionId}: ${error.message}\n`);
-	}
+	});
 }
 
 module.exports = {

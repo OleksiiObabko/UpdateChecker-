@@ -1,13 +1,14 @@
 const state = require('./state');
 const { getMerchantChatId } = require('./merchantChats');
-const { psChatMap } = require('./telegramHandler');
+const { psChatMap, pickClientsForChat } = require('./telegramHandler');
 const { applyStatusFromMatch } = require('./slackUtils');
 
 async function findMerchantMessage(clients, chatId, merchantId) {
 	const searchTerm = merchantId.toString().trim();
 	const cutoffTs = Math.floor(Date.now() / 1000) - 14 * 24 * 60 * 60;
+	const candidateClients = pickClientsForChat(clients, chatId);
 
-	for (const client of clients) {
+	for (const client of candidateClients) {
 		try {
 			const recent = await client.getMessages(chatId, { limit: 50 });
 			let match = recent.find(m => m.message && m.message.includes(searchTerm) && m.date >= cutoffTs);
@@ -33,7 +34,7 @@ async function findMerchantMessage(clients, chatId, merchantId) {
 					mediaGroup.push(match.media);
 				}
 
-				return { message: match, media: mediaGroup };
+				return { message: match, media: mediaGroup, sourceClient: client };
 			}
 		} catch (err) {}
 	}
@@ -132,7 +133,6 @@ async function runMerchantSubmissionCycle(mainDoc, clients) {
 	if (candidates.length === 0) return;
 
 	const processedSearchTerms = new Set();
-	const mainClient = clients[0];
 
 	for (const baseTx of candidates) {
 		const searchTerm = (baseTx.merchantId && baseTx.merchantId.toString().trim() !== '') ? baseTx.merchantId.toString().trim() : baseTx.ufId.toString().trim();
@@ -164,6 +164,8 @@ async function runMerchantSubmissionCycle(mainDoc, clients) {
 			if (!psChatIds || psChatIds.length === 0) continue;
 
 			const targetPsChatId = psChatIds[0];
+			const submissionClient = pickClientsForChat(clients, targetPsChatId)[0];
+
 			const isBotIntegration = externalPsNames.includes(psName);
 
 			if (isBotIntegration) {
@@ -184,9 +186,9 @@ async function runMerchantSubmissionCycle(mainDoc, clients) {
 					const idText = tx.transactionId.toString().trim();
 					const captionText = `/createTicket\nType: ${ticketType}\nTransaction ID: ${idText}\nComment: ${commentPart}`;
 
-					const success = await submitToPs(mainClient, targetPsChatId, captionText, foundData.media);
+					const success = await submitToPs(submissionClient, targetPsChatId, captionText, foundData.media);
 					if (success) {
-						await applyStatusFromMatch('Автоподача ПС', tx, 'in progress');
+						await applyStatusFromMatch(mainDoc, 'Автоподача ПС', tx, 'in progress');
 					}
 				}
 			} else {
@@ -197,11 +199,11 @@ async function runMerchantSubmissionCycle(mainDoc, clients) {
 				}
 
 				const captionText = psIds.join('\n');
-				const success = await submitToPs(mainClient, targetPsChatId, captionText, foundData.media);
+				const success = await submitToPs(submissionClient, targetPsChatId, captionText, foundData.media);
 
 				if (success) {
 					for (const tx of validGroup) {
-						await applyStatusFromMatch('Автоподача ПС', tx, 'in progress');
+						await applyStatusFromMatch(mainDoc, 'Автоподача ПС', tx, 'in progress');
 					}
 				}
 			}

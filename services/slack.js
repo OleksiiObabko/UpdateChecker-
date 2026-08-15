@@ -14,7 +14,7 @@ function getPsType(psNameRaw) {
 	return null;
 }
 
-function createSlackApp() {
+function createSlackApp(doc) {
 	const slackApp = new App({
 		token: process.env.SLACK_BOT_TOKEN,
 		appToken: process.env.SLACK_APP_TOKEN,
@@ -46,7 +46,7 @@ function createSlackApp() {
 			if (!match) return;
 
 			const transactionId = match[1];
-			const matchedTx = await resolveTransactionById(transactionId);
+			const matchedTx = await resolveTransactionById(doc, transactionId);
 			if (!matchedTx) return;
 
 			const psType = getPsType(matchedTx.psName);
@@ -55,9 +55,9 @@ function createSlackApp() {
 			const ourUserId = process.env.OUR_SLACK_USER_ID;
 
 			if (psType === 'standard') {
-				await handleStandardSlackMessage(message, matchedTx, isReply, ourUserId);
+				await handleStandardSlackMessage(doc, message, matchedTx, isReply, ourUserId);
 			} else if (psType === 'ticket') {
-				await handleTicketSlackMessage(message, matchedTx, isReply, ourUserId);
+				await handleTicketSlackMessage(doc, message, matchedTx, isReply, ourUserId);
 			}
 		} catch (error) {
 			process.stdout.write(`\x1b[2K\rПомилка обробки Slack-повідомлення: ${error.message}\n`);
@@ -106,10 +106,10 @@ function createSlackApp() {
 			if (!match) return;
 
 			const transactionId = match[1];
-			const matchedTx = await resolveTransactionById(transactionId);
+			const matchedTx = await resolveTransactionById(doc, transactionId);
 			if (!matchedTx) return;
 
-			await applyStatusFromMatch('Slack, reaction', matchedTx, 'in progress');
+			await applyStatusFromMatch(doc, 'Slack, reaction', matchedTx, 'in progress');
 		} catch (error) {
 		}
 	});
@@ -165,9 +165,9 @@ async function runSlackBackfill(doc, client) {
 					const ourUserId = process.env.OUR_SLACK_USER_ID;
 
 					if (psType === 'standard') {
-						await processStandardBackfillThread(tx, ourUserId, threadRes.messages);
+						await processStandardBackfillThread(doc, tx, ourUserId, threadRes.messages);
 					} else if (psType === 'ticket') {
-						await processTicketBackfillThread(tx, ourUserId, threadRes.messages);
+						await processTicketBackfillThread(doc, tx, ourUserId, threadRes.messages);
 					}
 					break;
 				}

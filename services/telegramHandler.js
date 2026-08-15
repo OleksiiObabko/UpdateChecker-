@@ -239,12 +239,36 @@ function makeReactionHandler(doc) {
 	};
 }
 
+const clientChatAccess = new Map(); // client -> Set<string> доступних chatId
+
+async function warmupTelegramClients(clients) {
+	for (const client of clients) {
+		try {
+			const dialogs = await client.getDialogs();
+			clientChatAccess.set(client, new Set(dialogs.map(d => d.id.toString())));
+		} catch (err) {
+			console.error('Помилка прогріву діалогів клієнта:', err.message);
+		}
+	}
+}
+
+function pickClientsForChat(clients, chatId) {
+	const targetId = chatId.toString();
+	const withAccess = clients.filter(c => {
+		const ids = clientChatAccess.get(c);
+		return ids && ids.has(targetId);
+	});
+
+	return withAccess.length > 0 ? withAccess : clients;
+}
+
 const chatRecentCache = new Map();
 
 async function findTransactionMessagesInChat(clients, chatId, searchTerm, cutoffTimestamp) {
 	let lastError = null;
+	const candidateClients = pickClientsForChat(clients, chatId);
 
-	for (const client of clients) {
+	for (const client of candidateClients) {
 		try {
 			const now = Date.now();
 			let recentMessages = [];
@@ -266,8 +290,6 @@ async function findTransactionMessagesInChat(clients, chatId, searchTerm, cutoff
 
 			if (validBase.length === 0) continue;
 
-			// Один прохід будує індекс parent -> children замість повторного O(n) сканування
-			// recentMessages на кожній ітерації while-циклу (як було раніше).
 			const childrenByParent = new Map();
 			for (const msg of recentMessages) {
 				if (msg.replyTo) {
@@ -400,6 +422,8 @@ async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = fals
 
 async function setupTelegram(mainDoc, telegramClients, ourUserIds) {
 	const { NewMessage, Raw } = require('telegram/events');
+
+	await warmupTelegramClients(telegramClients);
 	await runTelegramBackfill(mainDoc, telegramClients, ourUserIds, true);
 	for (const client of telegramClients) {
 		client.addEventHandler(makeTelegramMessageHandler(mainDoc, client, ourUserIds), new NewMessage({}));
@@ -408,4 +432,4 @@ async function setupTelegram(mainDoc, telegramClients, ourUserIds) {
 	console.log(`Telegram: підключено ${telegramClients.length} клієнт(и), слухаємо чатів: ${knownChatIds.length}`);
 }
 
-module.exports = { setupTelegram, runTelegramBackfill, psChatMap };
+module.exports = { setupTelegram, runTelegramBackfill, psChatMap, pickClientsForChat };

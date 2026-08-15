@@ -1,185 +1,39 @@
-const { App } = require('@slack/bolt');
-const state = require('./state');
-const { resolveTransactionById, applyStatusFromMatch } = require('./slackUtils');
-const { handleStandardSlackMessage, processStandardBackfillThread } = require('./slackStandard');
-const { handleTicketSlackMessage, processTicketBackfillThread } = require('./slackTicket');
+const { applyStatusFromMatch } = require('./slackUtils');
 
-function getPsType(psNameRaw) {
-	const psName = (psNameRaw || '').toString().trim().toLowerCase();
-	const standardList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
-	const ticketList = process.env.SLACK_TICKET_PS ? process.env.SLACK_TICKET_PS.split(',').map(s => s.trim().toLowerCase()) : [];
-
-	if (standardList.includes(psName)) return 'standard';
-	if (ticketList.includes(psName)) return 'ticket';
-	return null;
+function isIgnoredBot(message) {
+	const name = message.username || (message.bot_profile && message.bot_profile.name) || '';
+	return name.includes('Augustus Customer Support');
 }
 
-function createSlackApp(doc) {
-	const slackApp = new App({
-		token: process.env.SLACK_BOT_TOKEN,
-		appToken: process.env.SLACK_APP_TOKEN,
-		socketMode: true
-	});
+async function handleTicketSlackMessage(doc, message, matchedTx, isReply, ourUserId) {
+	if (isIgnoredBot(message)) return;
 
-	slackApp.message(async ({ message, client }) => {
-		if (message.subtype === 'message_changed' || message.subtype === 'message_deleted') return;
+	const isFromUs = message.user === ourUserId;
+	if (!isReply && !isFromUs) return;
 
-		try {
-			const isReply = message.thread_ts && message.ts !== message.thread_ts;
-			let parentText = '';
-
-			if (isReply) {
-				const threadData = await client.conversations.replies({
-					channel: message.channel,
-					ts: message.thread_ts,
-					limit: 1
-				});
-				const parentMessage = threadData.messages[0];
-				if (!parentMessage || !parentMessage.text) return;
-				parentText = parentMessage.text;
-			} else {
-				if (!message.text) return;
-				parentText = message.text;
-			}
-
-			const match = parentText.match(/\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}|\d+)\b/);
-			if (!match) return;
-
-			const transactionId = match[1];
-			const matchedTx = await resolveTransactionById(doc, transactionId);
-			if (!matchedTx) return;
-
-			const psType = getPsType(matchedTx.psName);
-			if (!psType) return;
-
-			const ourUserId = process.env.OUR_SLACK_USER_ID;
-
-			if (psType === 'standard') {
-				await handleStandardSlackMessage(doc, message, matchedTx, isReply, ourUserId);
-			} else if (psType === 'ticket') {
-				await handleTicketSlackMessage(doc, message, matchedTx, isReply, ourUserId);
-			}
-		} catch (error) {
-			process.stdout.write(`\x1b[2K\rПомилка обробки Slack-повідомлення: ${error.message}\n`);
-		}
-	});
-
-	slackApp.event('reaction_added', async ({ event, client }) => {
-		try {
-			if (event.item.type !== 'message') return;
-
-			const channel = event.item.channel;
-			const ts = event.item.ts;
-
-			const history = await client.conversations.history({
-				channel: channel,
-				latest: ts,
-				limit: 1,
-				inclusive: true
-			});
-
-			const msg = history.messages && history.messages[0];
-			if (!msg) return;
-
-			let parentText = '';
-
-			if (msg.thread_ts) {
-				if (msg.ts === msg.thread_ts) {
-					parentText = msg.text;
-				} else {
-					const threadData = await client.conversations.replies({
-						channel: channel,
-						ts: msg.thread_ts,
-						limit: 1
-					});
-					if (threadData.messages && threadData.messages[0]) {
-						parentText = threadData.messages[0].text;
-					}
-				}
-			} else {
-				parentText = msg.text;
-			}
-
-			if (!parentText) return;
-
-			const match = parentText.match(/\b([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}|\d+)\b/);
-			if (!match) return;
-
-			const transactionId = match[1];
-			const matchedTx = await resolveTransactionById(doc, transactionId);
-			if (!matchedTx) return;
-
-			await applyStatusFromMatch(doc, 'Slack, reaction', matchedTx, 'in progress');
-		} catch (error) {
-		}
-	});
-
-	return slackApp;
+	const newStatus = isFromUs ? 'in progress' : 'update';
+	await applyStatusFromMatch(doc, 'Slack [Ticket], live', matchedTx, newStatus);
 }
 
-async function runSlackBackfill(doc, client) {
-	process.stdout.write(`\x1b[2K\rБекфіл Slack: розпочато...\n`);
-	const standardList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
-	const ticketList = process.env.SLACK_TICKET_PS ? process.env.SLACK_TICKET_PS.split(',').map(s => s.trim().toLowerCase()) : [];
-	const allSlackPs = [...standardList, ...ticketList];
+async function processTicketBackfillThread(doc, tx, ourUserId, threadMessages) {
+	const validMessages = threadMessages.filter(m => !isIgnoredBot(m));
 
-	if (allSlackPs.length === 0) return;
+	if (validMessages.length === 0) return;
 
-	const targetTxs = state.activeTransactions.filter(tx => {
-		const ps = (tx.psName || '').toString().trim().toLowerCase();
-		const st = (tx.status || '').toString().trim().toLowerCase();
-		return allSlackPs.includes(ps) && (st === '' || st === 'in progress' || st === 'update');
-	});
-
-	if (targetTxs.length === 0) return;
-
-	for (const tx of targetTxs) {
-		try {
-			const searchRes = await client.search.messages({
-				query: `"${tx.transactionId}"`,
-				count: 20,
-				sort: 'timestamp',
-				sort_dir: 'desc',
-				token: process.env.SLACK_USER_TOKEN || process.env.SLACK_BOT_TOKEN
-			});
-
-			const searchMatches = searchRes.messages && searchRes.messages.matches ? searchRes.messages.matches : [];
-
-			if (searchMatches.length > 0) {
-				const rootCandidates = new Map();
-				for (const msg of searchMatches) {
-					if (!msg.channel || !msg.channel.id) continue;
-					const rootTs = msg.thread_ts || msg.ts;
-					rootCandidates.set(`${msg.channel.id}|${rootTs}`, { channelId: msg.channel.id, rootTs });
-				}
-
-				for (const { channelId, rootTs } of rootCandidates.values()) {
-					const threadRes = await client.conversations.replies({ channel: channelId, ts: rootTs });
-
-					if (!threadRes.messages || threadRes.messages.length === 0) continue;
-
-					const parentText = (threadRes.messages[0].text || '').toLowerCase();
-					if (!parentText.includes(tx.transactionId.toString().toLowerCase())) continue;
-
-					const psType = getPsType(tx.psName);
-					const ourUserId = process.env.OUR_SLACK_USER_ID;
-
-					if (psType === 'standard') {
-						await processStandardBackfillThread(doc, tx, ourUserId, threadRes.messages);
-					} else if (psType === 'ticket') {
-						await processTicketBackfillThread(doc, tx, ourUserId, threadRes.messages);
-					}
-					break;
-				}
-			}
-		} catch (err) {
-			process.stdout.write(`\x1b[2K\rПомилка бекфілу Slack для ${tx.transactionId}: ${err.message}\n`);
+	if (validMessages.length === 1) {
+		const isFromUs = validMessages[0].user === ourUserId;
+		if (isFromUs) {
+			await applyStatusFromMatch(doc, 'Slack [Ticket], backfill (новий)', tx, 'in progress');
 		}
-
-		await new Promise(resolve => setTimeout(resolve, 4500));
+		return;
 	}
 
-	process.stdout.write(`\x1b[2K\rБекфіл Slack: успішно завершено.\n`);
+	const lastReply = validMessages[validMessages.length - 1];
+	const isFromUs = lastReply.user === ourUserId;
+	const hasReaction = lastReply.reactions && lastReply.reactions.length > 0;
+	const newStatus = (isFromUs || hasReaction) ? 'in progress' : 'update';
+
+	await applyStatusFromMatch(doc, 'Slack [Ticket], backfill', tx, newStatus);
 }
 
-module.exports = { createSlackApp, runSlackBackfill };
+module.exports = { handleTicketSlackMessage, processTicketBackfillThread };

@@ -20,6 +20,8 @@ async function getMerchantChatId(doc, clients, chatName) {
 		}
 	}
 
+	const ambiguousByClient = [];
+
 	for (const [index, client] of clients.entries()) {
 		const dialogs = getCachedDialogs(client);
 		const matches = dialogs.filter(d => (d.title || '').toString().trim() === targetName);
@@ -38,9 +40,16 @@ async function getMerchantChatId(doc, clients, chatName) {
 			}
 			return Number(foundChatId);
 		} else if (matches.length > 1) {
-			console.log(`[MerchantChats] Знайдено більше одного чату з назвою "${targetName}". Пропускаємо.`);
-			return null;
+			ambiguousByClient.push({ clientIndex: index + 1, ids: matches.map(m => m.id.toString()) });
 		}
+	}
+
+	if (ambiguousByClient.length > 0) {
+		const details = ambiguousByClient
+			.map(a => `клієнт ${a.clientIndex}: [${a.ids.join(', ')}]`)
+			.join(' | ');
+		console.log(`[MerchantChats] Неоднозначна назва чату "${targetName}" — жоден клієнт не дав однозначного збігу. Кандидати: ${details}. Додайте правильний ID вручну в аркуш "Мерчант-чати".`);
+		return null;
 	}
 
 	return null;

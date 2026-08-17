@@ -58,7 +58,7 @@ function groupRelatedRows(messageText, baseTx) {
 	});
 }
 
-async function submitToPs(client, psChatId, captionText, mediaGroup) {
+async function submitToPs(downloadClient, sendClient, psChatId, captionText, mediaGroup) {
 	try {
 		let sentResult;
 		if (mediaGroup && mediaGroup.length > 0) {
@@ -67,7 +67,7 @@ async function submitToPs(client, psChatId, captionText, mediaGroup) {
 			for (let i = 0; i < mediaGroup.length; i++) {
 				try {
 					const media = mediaGroup[i];
-					const buffer = await client.downloadMedia(media);
+					const buffer = await downloadClient.downloadMedia(media);
 					if (buffer) {
 						let fileName = `receipt_${Date.now()}_${i}.jpg`;
 
@@ -92,26 +92,26 @@ async function submitToPs(client, psChatId, captionText, mediaGroup) {
 
 						buffer.name = fileName;
 						downloadedFiles.push(buffer);
+					} else {
+						console.error(`[MerchantSubmission] downloadMedia повернув порожній буфер для медіа #${i} (чат ПС: ${psChatId})`);
 					}
 				} catch (dlErr) {
+					console.error(`[MerchantSubmission] Помилка завантаження медіа #${i} (чат ПС: ${psChatId}): ${dlErr.message}`);
 				}
 			}
 
-			if (downloadedFiles.length > 0) {
-				sentResult = await client.sendFile(psChatId, {
-					file: downloadedFiles,
-					caption: captionText,
-					forceDocument: true
-				});
-			} else {
-				sentResult = await client.sendFile(psChatId, {
-					file: mediaGroup,
-					caption: captionText,
-					forceDocument: true
-				});
+			if (downloadedFiles.length === 0) {
+				console.error(`[MerchantSubmission] Жодне медіа не вдалось завантажити для відправки в чат ПС ${psChatId}. Відправку скасовано.`);
+				return false;
 			}
+
+			sentResult = await sendClient.sendFile(psChatId, {
+				file: downloadedFiles,
+				caption: captionText,
+				forceDocument: true
+			});
 		} else {
-			sentResult = await client.sendMessage(psChatId, { message: captionText });
+			sentResult = await sendClient.sendMessage(psChatId, { message: captionText });
 		}
 
 		const isSuccess = Array.isArray(sentResult) ? sentResult.length > 0 && sentResult[0].id : sentResult && sentResult.id;
@@ -168,6 +168,7 @@ async function runMerchantSubmissionCycle(mainDoc, clients) {
 
 			const targetPsChatId = psChatIds[0];
 			const submissionClient = pickClientsForChat(clients, targetPsChatId)[0];
+			const downloadClient = foundData.sourceClient;
 
 			const isBotIntegration = externalPsNames.includes(psName);
 
@@ -189,7 +190,7 @@ async function runMerchantSubmissionCycle(mainDoc, clients) {
 					const idText = tx.transactionId.toString().trim();
 					const captionText = `/createTicket\nType: ${ticketType}\nTransaction ID: ${idText}\nComment: ${commentPart}`;
 
-					const success = await submitToPs(submissionClient, targetPsChatId, captionText, foundData.media);
+					const success = await submitToPs(downloadClient, submissionClient, targetPsChatId, captionText, foundData.media);
 					if (success) {
 						await applyStatusFromMatch(mainDoc, 'Автоподача ПС', tx, 'in progress');
 					}
@@ -202,7 +203,7 @@ async function runMerchantSubmissionCycle(mainDoc, clients) {
 				}
 
 				const captionText = psIds.join('\n');
-				const success = await submitToPs(submissionClient, targetPsChatId, captionText, foundData.media);
+				const success = await submitToPs(downloadClient, submissionClient, targetPsChatId, captionText, foundData.media);
 
 				if (success) {
 					for (const tx of validGroup) {

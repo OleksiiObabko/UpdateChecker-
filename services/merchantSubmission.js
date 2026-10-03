@@ -125,8 +125,6 @@ async function submitToPs(downloadClient, sendClient, psChatId, captionText, med
 }
 
 async function runMerchantSubmissionCycle(mainDoc, clients) {
-	const externalPsNames = process.env.EXTERNAL_PS_NAMES ? process.env.EXTERNAL_PS_NAMES.split(',').map(s => s.trim().toLowerCase()) : [];
-
 	const candidates = state.activeTransactions.filter(tx =>
 		(tx.status || '').toString().trim().toLowerCase() === 'send to ps' &&
 		(tx.chatName || '').trim() !== '' &&
@@ -170,45 +168,19 @@ async function runMerchantSubmissionCycle(mainDoc, clients) {
 			const submissionClient = pickClientsForChat(clients, targetPsChatId)[0];
 			const downloadClient = foundData.sourceClient;
 
-			const isBotIntegration = externalPsNames.includes(psName);
+			// Звичайна відправка для всіх ПС (без ботів/тікетів)
+			for (const tx of validGroup) {
+				let idText = tx.transactionId.toString().trim();
+				if (tx.requestType && tx.requestType.toLowerCase() === 'арн-код') idText += '\nUTR';
+				psIds.push(idText);
+			}
 
-			if (isBotIntegration) {
+			const captionText = psIds.join('\n');
+			const success = await submitToPs(downloadClient, submissionClient, targetPsChatId, captionText, foundData.media);
+
+			if (success) {
 				for (const tx of validGroup) {
-					let commentPart = '';
-					if (tx.requestType && tx.requestType.toLowerCase() === 'арн-код') {
-						commentPart = 'UTR';
-					}
-
-					let ticketType = 'Refill';
-					const methodType = (tx.method || '').toLowerCase();
-					if (methodType === 'credit') {
-						ticketType = 'Payout';
-					} else if (methodType === 'purchase') {
-						ticketType = 'Refill';
-					}
-
-					const idText = tx.transactionId.toString().trim();
-					const captionText = `/createTicket\nType: ${ticketType}\nTransaction ID: ${idText}\nComment: ${commentPart}`;
-
-					const success = await submitToPs(downloadClient, submissionClient, targetPsChatId, captionText, foundData.media);
-					if (success) {
-						await applyStatusFromMatch(mainDoc, 'Автоподача ПС', tx, 'in progress');
-					}
-				}
-			} else {
-				for (const tx of validGroup) {
-					let idText = tx.transactionId.toString().trim();
-					if (tx.requestType && tx.requestType.toLowerCase() === 'арн-код') idText += '\nUTR';
-					psIds.push(idText);
-				}
-
-				const captionText = psIds.join('\n');
-				const success = await submitToPs(downloadClient, submissionClient, targetPsChatId, captionText, foundData.media);
-
-				if (success) {
-					for (const tx of validGroup) {
-						await applyStatusFromMatch(mainDoc, 'Автоподача ПС', tx, 'in progress');
-					}
+					await applyStatusFromMatch(mainDoc, 'Автоподача ПС', tx, 'in progress');
 				}
 			}
 

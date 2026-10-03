@@ -539,7 +539,6 @@ async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = fals
 	const cutoffTimestamp = Math.floor(now / 1000) - BACKFILL_DAYS * 24 * 60 * 60;
 	const slackPsList = process.env.SLACK_PS ? process.env.SLACK_PS.split(',').map(s => s.trim().toLowerCase()) : [];
 	const slackTicketPsList = process.env.SLACK_TICKET_PS ? process.env.SLACK_TICKET_PS.split(',').map(s => s.trim().toLowerCase()) : [];
-	const externalPsNames = process.env.EXTERNAL_PS_NAMES ? process.env.EXTERNAL_PS_NAMES.split(',').map(s => s.trim().toLowerCase()) : [];
 
 	const initialActiveCount = state.activeTransactions.filter(tx => {
 		const status = (tx.status || '').toString().trim().toLowerCase();
@@ -590,7 +589,8 @@ async function runTelegramBackfill(doc, clients, ourUserIds, isInitialRun = fals
 
 		if (!chatIds || chatIds.length === 0) {
 			skippedNoChat++;
-			if (psNameRaw && !slackPsList.includes(psName) && !slackTicketPsList.includes(psName) && !externalPsNames.includes(psName)) {
+			// Прибрали перевірку на externalPsNames
+			if (psNameRaw && !slackPsList.includes(psName) && !slackTicketPsList.includes(psName)) {
 				unmonitoredPsNames.add(psNameRaw);
 			}
 			continue;

@@ -24,8 +24,7 @@ console.error = function (...args) {
 	originalError.apply(console, args);
 };
 
-// const ALL_SHEETS = ['Кити', 'Омнік', 'Лелеки', 'Фікси', 'Дракони', 'Корівки', 'Вулик'];
-const ALL_SHEETS = ['Кити', 'Омнік', 'Корівки'];
+const ALL_SHEETS = ['Кити', 'Омнік', 'Лелеки', 'Фікси', 'Дракони', 'Корівки', 'Вулик'];
 
 async function promptSheetSelection() {
 	const response = await prompts({
